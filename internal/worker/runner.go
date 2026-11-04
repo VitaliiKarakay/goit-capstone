@@ -22,27 +22,30 @@ type Store interface {
 }
 
 type Stats struct {
-	DelayedNak atomic.Int64
+	DelayedNak      atomic.Int64
+	NotOwnerRejects atomic.Int64
 }
 
 type Runner struct {
-	log         *slog.Logger
-	store       Store
-	sender      sender.Sender
-	workerID    string
-	retryDelays []time.Duration
-	nakDelay    time.Duration
-	Stats       Stats
+	log              *slog.Logger
+	store            Store
+	sender           sender.Sender
+	workerID         string
+	retryDelays      []time.Duration
+	nakDelay         time.Duration
+	progressInterval time.Duration
+	Stats            Stats
 }
 
 func New(log *slog.Logger, store Store, send sender.Sender, workerID string) *Runner {
 	return &Runner{
-		log:         log,
-		store:       store,
-		sender:      send,
-		workerID:    workerID,
-		retryDelays: DBRetryDelays,
-		nakDelay:    NakDelay,
+		log:              log,
+		store:            store,
+		sender:           send,
+		workerID:         workerID,
+		retryDelays:      DBRetryDelays,
+		nakDelay:         NakDelay,
+		progressInterval: AckProgressInterval,
 	}
 }
 
@@ -91,6 +94,7 @@ func (r *Runner) Run(stop, work context.Context, pull func() (*nats.Subscription
 type ackMessage interface {
 	Ack(...nats.AckOpt) error
 	NakWithDelay(time.Duration, ...nats.AckOpt) error
+	InProgress(...nats.AckOpt) error
 }
 
 func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
@@ -145,7 +149,7 @@ func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
 			return
 		}
 		if !r.ownsJob(job) {
-			r.delay(msg, job.ID, "resume processing", errors.New("job owned by another worker"))
+			r.rejectNotOwner(msg, job.ID, "resume processing")
 			return
 		}
 		r.attempt(ctx, msg, job)
@@ -162,9 +166,13 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 		return
 	}
 	if !r.ownsJob(job) {
-		r.delay(msg, job.ID, "attempt", errors.New("job owned by another worker"))
+		r.rejectNotOwner(msg, job.ID, "attempt")
 		return
 	}
+
+	stopProgress := r.keepInProgress(ctx, msg)
+	defer stopProgress()
+
 	attempt := *job.SendAttemptID
 	id := job.ID
 
@@ -194,6 +202,36 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 		r.log.Error("sender failed", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
 	}
 	r.finishUntilDone(ctx, msg, id, status, lastError)
+}
+
+// keepInProgress sends JetStream in-progress acks until stop is called or ctx ends.
+func (r *Runner) keepInProgress(ctx context.Context, msg ackMessage) func() {
+	interval := r.progressInterval
+	if interval <= 0 {
+		interval = AckProgressInterval
+	}
+	stop := make(chan struct{})
+	go func() {
+		_ = msg.InProgress()
+		if interval <= 0 {
+			return
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := msg.InProgress(); err != nil {
+					r.log.Error("in progress", "err", err, "worker_id", r.workerID)
+				}
+			}
+		}
+	}()
+	return func() { close(stop) }
 }
 
 // finishUntilDone keeps the JetStream message unacked and retries Finish with
@@ -233,6 +271,11 @@ func wait(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
+func (r *Runner) rejectNotOwner(msg ackMessage, id uuid.UUID, op string) {
+	r.Stats.NotOwnerRejects.Add(1)
+	r.delay(msg, id, op, errors.New("job owned by another worker"))
+}
+
 func (r *Runner) delay(msg ackMessage, id uuid.UUID, op string, err error) {
 	r.log.Error(op+" failed", "job_id", id.String(), "worker_id", r.workerID, "err", err, "nak_delay", r.nakDelay.String())
 	r.Stats.DelayedNak.Add(1)
@@ -251,4 +294,9 @@ func (r *Runner) SetDelays(nakDelay time.Duration, dbRetries []time.Duration) {
 	if dbRetries != nil {
 		r.retryDelays = dbRetries
 	}
+}
+
+// SetProgressInterval overrides how often in-progress acks are sent.
+func (r *Runner) SetProgressInterval(interval time.Duration) {
+	r.progressInterval = interval
 }

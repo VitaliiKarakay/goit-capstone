@@ -337,6 +337,48 @@ func TestTwoWorkersRaceBeforeSendStarted(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := uuid.MustParse(id)
+
+	var owner string
+	published := false
+	beforeA := env.runnerBy["worker-a"].Stats.NotOwnerRejects.Load()
+	beforeB := env.runnerBy["worker-b"].Stats.NotOwnerRejects.Load()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		job := env.get(t, id)
+		if owner == "" {
+			owner, _ = job["worker_id"].(string)
+		}
+		if owner != "" && job["status"] == "processing" && job["send_started_at"] == nil && !published {
+			if _, err := env.js.Publish(natspub.Subject, []byte(id), nats.MsgId("race-force-"+id)); err != nil {
+				t.Fatal(err)
+			}
+			published = true
+		}
+		other := "worker-b"
+		beforeOther := beforeB
+		if owner == "worker-b" {
+			other = "worker-a"
+			beforeOther = beforeA
+		}
+		if published && owner != "" && env.runnerBy[other].Stats.NotOwnerRejects.Load()-beforeOther >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !published {
+		t.Fatal("job never entered processing before send_started_at was recorded")
+	}
+	other := "worker-b"
+	beforeOther := beforeB
+	if owner == "worker-b" {
+		other = "worker-a"
+		beforeOther = beforeA
+	}
+	if env.runnerBy[other].Stats.NotOwnerRejects.Load()-beforeOther < 1 {
+		t.Fatalf("%s did not reject a foreign job before send_started_at was recorded", other)
+	}
+
 	env.waitStatus(t, id, "succeeded", 45*time.Second)
 	if env.rec.count(jobID) != 1 {
 		t.Fatalf("sender calls = %d", env.rec.count(jobID))
@@ -353,26 +395,49 @@ func TestFinishOutlastsAckWaitWithoutResending(t *testing.T) {
 	}
 	jobID := uuid.MustParse(id)
 
+	slowStart := time.Now()
 	deadline := time.Now().Add(20 * time.Second)
+	var job map[string]any
 	for time.Now().Before(deadline) {
-		job := env.get(t, id)
-		if job["send_started_at"] != nil && env.rec.count(jobID) == 1 {
+		job = env.get(t, id)
+		if job["send_started_at"] != nil && env.rec.count(jobID) == 1 && job["status"] == "processing" {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if env.rec.count(jobID) != 1 {
-		t.Fatalf("sender calls before ack wait = %d", env.rec.count(jobID))
+	if env.rec.count(jobID) != 1 || job["status"] != "processing" || job["send_started_at"] == nil {
+		t.Fatalf("expected one send and processing before finish: %+v calls=%d", job, env.rec.count(jobID))
 	}
-	time.Sleep(itestAckWait + time.Second)
+	redeliveredBefore := env.consumerRedelivered()
+	if redeliveredBefore < 0 {
+		t.Fatal("could not read consumer redelivery count from the broker")
+	}
+
+	for time.Since(slowStart) < itestAckWait+time.Second {
+		time.Sleep(100 * time.Millisecond)
+	}
 	if env.rec.count(jobID) != 1 {
 		t.Fatalf("sender calls after ack wait = %d", env.rec.count(jobID))
+	}
+	if extra := env.consumerRedelivered() - redeliveredBefore; extra < 0 {
+		t.Fatal("could not read consumer redelivery count from the broker")
+	} else if extra != 0 {
+		t.Fatalf("broker redelivered during in-progress finish: %d", extra)
+	}
+	job = env.get(t, id)
+	if job["status"] != "processing" {
+		t.Fatalf("result was saved before finish recovered: %+v", job)
 	}
 
 	env.fault.failFinish.Store(false)
 	env.waitStatus(t, id, "succeeded", 30*time.Second)
 	if env.rec.count(jobID) != 1 {
 		t.Fatalf("sender calls = %d", env.rec.count(jobID))
+	}
+	if extra := env.consumerRedelivered() - redeliveredBefore; extra < 0 {
+		t.Fatal("could not read consumer redelivery count from the broker")
+	} else if extra != 0 {
+		t.Fatalf("broker redelivered while saving result: %d", extra)
 	}
 }
 
@@ -427,6 +492,7 @@ type environment struct {
 	nc        *nats.Conn
 	rec       *recorder
 	runners   []*worker.Runner
+	runnerBy  map[string]*worker.Runner
 	cancel    context.CancelFunc
 	pg        *pgmod.PostgresContainer
 	nats      *tcnats.NATSContainer
@@ -510,6 +576,7 @@ func startEnv(ctx context.Context) (*environment, error) {
 
 	appCtx, cancel := context.WithCancel(context.Background())
 	rec := &recorder{}
+	runnerBy := map[string]*worker.Runner{}
 	var runners []*worker.Runner
 	for _, id := range []string{"worker-a", "worker-b"} {
 		wbus, err := natspub.Connect(ctx, brokerURL, id, log)
@@ -519,6 +586,8 @@ func startEnv(ctx context.Context) (*environment, error) {
 		}
 		runner := worker.New(log, fault, recordingSender{workerID: id, rec: rec}, id)
 		runner.SetDelays(300*time.Millisecond, nil)
+		runner.SetProgressInterval(itestAckWait / 3)
+		runnerBy[id] = runner
 		go func() { _ = runner.Run(appCtx, appCtx, wbus.Pull) }()
 		runners = append(runners, runner)
 	}
@@ -534,6 +603,7 @@ func startEnv(ctx context.Context) (*environment, error) {
 	e.nc = nc
 	e.rec = rec
 	e.runners = runners
+	e.runnerBy = runnerBy
 	e.cancel = func() {
 		cancel()
 		server.Close()
@@ -647,6 +717,22 @@ func (e *environment) outboxPublished(t *testing.T, id string) (published bool, 
 		return false, false
 	}
 	return at != nil, true
+}
+
+func (e *environment) consumerRedelivered() int {
+	for range 50 {
+		if e.nc != nil {
+			if js, err := e.nc.JetStream(); err == nil {
+				e.js = js
+			}
+		}
+		info, err := e.js.ConsumerInfo(natspub.Stream, natspub.Durable)
+		if err == nil {
+			return info.NumRedelivered
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return -1
 }
 
 func (e *environment) consumerSeq(t *testing.T) uint64 {

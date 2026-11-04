@@ -9,6 +9,9 @@ const (
 	MaxDeliver = 20
 	AckWait    = 30 * time.Second
 	NakDelay   = 5 * time.Second
+	// AckProgressInterval resets AckWait while a message is being processed.
+	// It must stay below AckWait so the broker does not redeliver in-flight work.
+	AckProgressInterval = 10 * time.Second
 )
 
 // DBRetryDelays are the waits between claim attempts inside a single delivery.

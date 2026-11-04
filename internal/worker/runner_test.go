@@ -168,6 +168,9 @@ func TestHandleSkipsAttemptWhenNotOwner(t *testing.T) {
 	if send.calls != 0 || store.marked || msg.acks != 0 || len(msg.naks) != 1 {
 		t.Fatalf("calls=%d marked=%v acks=%d naks=%v", send.calls, store.marked, msg.acks, msg.naks)
 	}
+	if runner.Stats.NotOwnerRejects.Load() != 1 {
+		t.Fatalf("not owner rejects = %d", runner.Stats.NotOwnerRejects.Load())
+	}
 }
 
 func TestHandleDelaysWhenDatabaseIsDown(t *testing.T) {
@@ -288,5 +291,9 @@ func (m *fakeMsg) Ack(...nats.AckOpt) error {
 
 func (m *fakeMsg) NakWithDelay(delay time.Duration, _ ...nats.AckOpt) error {
 	m.naks = append(m.naks, delay)
+	return nil
+}
+
+func (m *fakeMsg) InProgress(...nats.AckOpt) error {
 	return nil
 }
