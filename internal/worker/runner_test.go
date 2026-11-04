@@ -152,6 +152,24 @@ func TestHandleDelaysProcessingWhenSendAlreadyStarted(t *testing.T) {
 	}
 }
 
+func TestHandleSkipsAttemptWhenNotOwner(t *testing.T) {
+	job := sampleJob()
+	job.Status = domain.StatusProcessing
+	owner := "worker-a"
+	job.WorkerID = &owner
+	store := &fakeStore{found: true, job: job}
+	send := &fakeSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.workerID = "worker-b"
+	runner.retryDelays = nil
+
+	runner.handle(context.Background(), msg.data, msg)
+	if send.calls != 0 || store.marked || msg.acks != 0 || len(msg.naks) != 1 {
+		t.Fatalf("calls=%d marked=%v acks=%d naks=%v", send.calls, store.marked, msg.acks, msg.naks)
+	}
+}
+
 func TestHandleDelaysWhenDatabaseIsDown(t *testing.T) {
 	store := &fakeStore{claimErr: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}}
 	send := &fakeSender{}
@@ -183,12 +201,14 @@ func testRunner(store Store, send sender.Sender) *Runner {
 
 func sampleJob() domain.Job {
 	attempt := uuid.New()
+	owner := "worker-test"
 	return domain.Job{
 		ID:            uuid.New(),
 		RecipientID:   "user-1",
 		Status:        domain.StatusQueued,
 		Payload:       []byte(`{"to":"a","subject":"s","body":"b"}`),
 		SendAttemptID: &attempt,
+		WorkerID:      &owner,
 	}
 }
 

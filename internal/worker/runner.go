@@ -144,6 +144,10 @@ func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
 			r.delay(msg, job.ID, "resume processing", errors.New("missing send attempt id"))
 			return
 		}
+		if !r.ownsJob(job) {
+			r.delay(msg, job.ID, "resume processing", errors.New("job owned by another worker"))
+			return
+		}
 		r.attempt(ctx, msg, job)
 	default:
 		r.log.Error("skip unexpected status", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
@@ -155,6 +159,10 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 	if job.SendAttemptID == nil {
 		r.log.Error("missing send attempt", "job_id", job.ID.String(), "worker_id", r.workerID)
 		_ = msg.Ack()
+		return
+	}
+	if !r.ownsJob(job) {
+		r.delay(msg, job.ID, "attempt", errors.New("job owned by another worker"))
 		return
 	}
 	attempt := *job.SendAttemptID
@@ -229,4 +237,18 @@ func (r *Runner) delay(msg ackMessage, id uuid.UUID, op string, err error) {
 	r.log.Error(op+" failed", "job_id", id.String(), "worker_id", r.workerID, "err", err, "nak_delay", r.nakDelay.String())
 	r.Stats.DelayedNak.Add(1)
 	_ = msg.NakWithDelay(r.nakDelay)
+}
+
+func (r *Runner) ownsJob(job domain.Job) bool {
+	return job.WorkerID != nil && *job.WorkerID == r.workerID
+}
+
+// SetDelays overrides retry pacing. Tests use shorter waits than production defaults.
+func (r *Runner) SetDelays(nakDelay time.Duration, dbRetries []time.Duration) {
+	if nakDelay > 0 {
+		r.nakDelay = nakDelay
+	}
+	if dbRetries != nil {
+		r.retryDelays = dbRetries
+	}
 }

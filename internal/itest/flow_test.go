@@ -326,6 +326,56 @@ func TestOutboxSurvivesNATSOutage(t *testing.T) {
 	}
 }
 
+const itestAckWait = 2 * time.Second
+
+func TestTwoWorkersRaceBeforeSendStarted(t *testing.T) {
+	env.fault.markSleep.Store(int64(3 * time.Second))
+	t.Cleanup(func() { env.fault.markSleep.Store(0) })
+	body := jobBody("race-"+uuid.NewString(), "user-race", time.Now().Add(-time.Second), "race")
+	_, id, err := env.post(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.MustParse(id)
+	env.waitStatus(t, id, "succeeded", 45*time.Second)
+	if env.rec.count(jobID) != 1 {
+		t.Fatalf("sender calls = %d", env.rec.count(jobID))
+	}
+}
+
+func TestFinishOutlastsAckWaitWithoutResending(t *testing.T) {
+	env.fault.failFinish.Store(true)
+	t.Cleanup(func() { env.fault.failFinish.Store(false) })
+	body := jobBody("ackwait-"+uuid.NewString(), "user-ackwait", time.Now().Add(-time.Second), "finish")
+	_, id, err := env.post(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.MustParse(id)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		job := env.get(t, id)
+		if job["send_started_at"] != nil && env.rec.count(jobID) == 1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if env.rec.count(jobID) != 1 {
+		t.Fatalf("sender calls before ack wait = %d", env.rec.count(jobID))
+	}
+	time.Sleep(itestAckWait + time.Second)
+	if env.rec.count(jobID) != 1 {
+		t.Fatalf("sender calls after ack wait = %d", env.rec.count(jobID))
+	}
+
+	env.fault.failFinish.Store(false)
+	env.waitStatus(t, id, "succeeded", 30*time.Second)
+	if env.rec.count(jobID) != 1 {
+		t.Fatalf("sender calls = %d", env.rec.count(jobID))
+	}
+}
+
 func TestTwoWorkersShareTheConsumer(t *testing.T) {
 	ids := make([]string, 0, 24)
 	for range 24 {
@@ -446,7 +496,7 @@ func startEnv(ctx context.Context) (*environment, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := bus.Ensure(ctx, worker.AckWait, worker.MaxDeliver); err != nil {
+	if err := bus.Ensure(ctx, itestAckWait, worker.MaxDeliver); err != nil {
 		return nil, err
 	}
 	nc, err := nats.Connect(brokerURL, nats.MaxReconnects(-1), nats.ReconnectWait(200*time.Millisecond))
@@ -468,6 +518,7 @@ func startEnv(ctx context.Context) (*environment, error) {
 			return nil, err
 		}
 		runner := worker.New(log, fault, recordingSender{workerID: id, rec: rec}, id)
+		runner.SetDelays(300*time.Millisecond, nil)
 		go func() { _ = runner.Run(appCtx, appCtx, wbus.Pull) }()
 		runners = append(runners, runner)
 	}
@@ -655,9 +706,13 @@ type faultStore struct {
 	failMark         atomic.Bool
 	failFinish       atomic.Bool
 	loseMarkResponse atomic.Bool
+	markSleep        atomic.Int64
 }
 
 func (s *faultStore) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error) {
+	if delay := time.Duration(s.markSleep.Load()); delay > 0 {
+		time.Sleep(delay)
+	}
 	if s.failMark.Load() {
 		return time.Time{}, dbDown()
 	}
