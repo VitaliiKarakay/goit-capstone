@@ -18,12 +18,21 @@ const (
 	StatusProcessing Status = "processing"
 	StatusSucceeded  Status = "succeeded"
 	StatusFailed     Status = "failed"
+	StatusCanceled   Status = "canceled"
 )
 
 var (
 	ErrNotFound      = errors.New("job not found")
 	ErrConflict      = errors.New("idempotency conflict")
 	ErrNotProcessing = errors.New("job is not processing")
+	ErrTooLate       = errors.New("cancel too late")
+)
+
+type CancelOutcome string
+
+const (
+	CancelOutcomeCanceled        CancelOutcome = "canceled"
+	CancelOutcomeAlreadyCanceled CancelOutcome = "already_canceled"
 )
 
 // NormalizeTime truncates to microseconds in UTC. PostgreSQL timestamptz
@@ -49,6 +58,7 @@ type Job struct {
 	LastError      *string
 	SendStartedAt  *time.Time
 	SendAttemptID  *uuid.UUID
+	CanceledAt     *time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	FinishedAt     *time.Time

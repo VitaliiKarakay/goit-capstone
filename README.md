@@ -1,143 +1,118 @@
-# Распределённый планировщик заданий
+# Distributed job scheduler
 
-Модуль принимает одно отложенное задание, хранит его в PostgreSQL и после `scheduled_at` передаёт `job_id` через NATS JetStream воркеру. Воркер атомарно забирает задание и вызывает тестовый отправитель `mock`. Письмо или SMS модуль не отправляет.
+This repository implements a single-job scheduling pipeline: HTTP API, PostgreSQL, NATS JetStream, and workers that call a mock sender (no real email or SMS).
 
-В этой итерации нет отмены, кампаний, подстановки переменных и автоматических повторов ошибки отправителя. Живой воркер повторяет операцию базы, если она отказала после захвата. Остановка процесса после вызова отправителя по-прежнему оставляет задание в `processing`.
+**Iteration 2** adds canceling a single job via `POST /jobs/{id}/cancel`. Campaigns, templates, and recovery of stuck `processing` jobs are still out of scope.
 
-## Требования
+## Requirements
 
-- Go 1.25.5
-- Docker и Docker Compose v2
-- Python 3 для `scripts/demo.py`
+- Go 1.25.5 (`GOTOOLCHAIN=local` recommended)
+- Docker Compose v2
+- Python 3 for demo scripts
 
-Образы и библиотеки зафиксированы: PostgreSQL `17.11-alpine`, NATS `2.15.2-alpine`, `pgx` v5.11.0, `nats.go` v1.53.1, goose v3.27.0. Клиент NATS собран под Go 1.25. Для этого сценария используются публикация, общий durable pull consumer и явное подтверждение.
+Pinned images: PostgreSQL `17.11-alpine`, NATS `2.15.2-alpine`. Libraries: pgx v5.11.0, nats.go v1.53.1, goose v3.27.0.
 
-Локальные учётные данные `scheduler` / `scheduler` предназначены только для этого стенда.
+Local credentials `scheduler` / `scheduler` are for this demo only.
 
-## Запуск
+## Run with Docker
 
 ```bash
 docker compose up --build
 ```
 
-Порты опубликованы только на `127.0.0.1`: API `${API_PORT:-8080}`, PostgreSQL `5432`, NATS `4222` и мониторинг NATS `8222`. Внутри контейнера контроллер слушает `0.0.0.0:8080`, иначе Docker не пробросит порт на хост. Авторизации нет.
-
-Если `8080` занят, внешний порт задаётся без правки Compose:
+Published on `127.0.0.1` only. API port defaults to `8080`:
 
 ```bash
 API_PORT=18080 docker compose up --build
 API=http://127.0.0.1:18080 python3 scripts/demo.py
+API=http://127.0.0.1:18080 python3 scripts/demo_cancel.py
 ```
 
-Сервис `migrate` один раз применяет миграции. Два воркера запускаются без фиксированного `container_name`.
+The `migrate` service applies SQL migrations once. Two worker replicas share one durable NATS consumer.
 
-Проверка:
+## Run on the host
 
-```bash
-curl -sS http://127.0.0.1:8080/healthz
-python3 scripts/demo.py
-```
-
-Остановка: `docker compose down`. Данные PostgreSQL и JetStream остаются в томах Compose.
-
-Запуск процессов на хосте. Программа не читает файл `.env`: конфигурация берётся только из окружения процесса. Копирование `.env.example` само по себе ничего не подставляет в `go run`. Переменные нужно экспортировать в оболочке, затем выполнить команды в отдельных терминалах.
+Processes read **environment variables only** (they do not load `.env` files). Export variables before `go run`:
 
 ```bash
 docker compose up -d postgres nats
 cp .env.example .env
-set -a
-source .env
-set +a
+set -a && source .env && set +a
 go run ./cmd/controller migrate
 go run ./cmd/controller
 go run ./cmd/worker
 ```
 
-Второй воркер — ещё один процесс `go run ./cmd/worker` с другим `WORKER_ID`.
+## HTTP API
 
-## HTTP
+### Create and read jobs
 
-`POST /jobs` создаёт задание. Новая запись возвращает код 201 и заголовок `Location`. Повтор с тем же `idempotency_key` и тем же каноническим содержимым отвечает `200` и тем же id. Другое содержимое с тем же ключом — `409`.
+- `POST /jobs` — create a job (`201` + `Location`, or `200` idempotent replay)
+- `GET /jobs/{id}` — full job view including `canceled_at` when applicable
 
-```bash
-curl -sS -D - http://127.0.0.1:8080/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"idempotency_key":"demo-1","recipient_id":"user-1","scheduled_at":"2026-11-07T12:00:00Z","sender":"mock","payload":{"to":"user@example.com","subject":"Тема","body":"Текст"}}'
-```
+Request body limit: 64 KiB before JSON decode. Payload object limit: 16 KiB. `scheduled_at` must be RFC3339 with timezone; stored in UTC with microsecond truncation.
 
-В демонстрации время считается от текущего момента. Время в прошлом допустимо: задание станет доступным на следующем проходе планировщика. Время дальше чем на 366 суток вперёд отклоняется. В `scheduled_at` обязателен часовой пояс, формат — RFC3339.
+Idempotency: same `idempotency_key` and canonical content returns the same job (including `canceled`). Different content → `409 idempotency_conflict`.
 
-Тело запроса ограничено 64 КиБ до разбора JSON. Отдельно `payload` не больше 16 КиБ. Несколько JSON-значений в одном теле отклоняются.
+### Cancel a job
+
+- `POST /jobs/{id}/cancel` — **empty body required** (non-empty body → `400 invalid_json`)
+
+| Job status | HTTP | `result` / error |
+|------------|------|------------------|
+| `scheduled`, `queued` | 200 | `canceled` |
+| `canceled` | 200 | `already_canceled` |
+| `processing`, `succeeded`, `failed` | 409 | `too_late` |
+| missing | 404 | `not_found` |
+
+Success body example:
 
 ```json
-{"error":{"code":"validation_error","message":"request validation failed","details":[{"field":"scheduled_at","code":"invalid_format"}]}}
+{"job_id":"…","status":"canceled","result":"canceled"}
 ```
 
-Коды ошибок: `invalid_json`, `request_too_large`, `validation_error`, `idempotency_conflict`, `not_found`, `internal_error`.
+Cancel is a conditional PostgreSQL update and races with worker claim on `queued` rows; only one side wins. Outbox rows may still be published; workers load status from the database and **Ack without calling the sender** for `canceled` jobs.
 
-`GET /jobs/{id}` возвращает сохранённые поля и состояние. `sender` в этой итерации только `mock`. В `payload` обязательны непустые строки `to`, `subject` и `body`. Дополнительные поля сохраняются.
+### Error shape
 
-## Время, хеш и числа
+```json
+{"error":{"code":"validation_error","message":"…","details":[{"field":"…","code":"…"}]}}
+```
 
-PostgreSQL хранит `timestamptz` с точностью до микросекунды. Перед хешем и перед записью время переводится в UTC и обрезается до микросекунды, без округления: `12:00:00.123456789Z` становится `12:00:00.123456Z`. Тот же момент с другим смещением даёт тот же хеш.
+Codes include: `invalid_json`, `request_too_large`, `validation_error`, `idempotency_conflict`, `not_found`, `too_late`, `internal_error`.
 
-Идемпотентность сравнивает SHA-256 канонического содержимого: `recipient_id`, нормализованный `scheduled_at`, `sender` и `payload`. Порядок ключей объекта и пробелы не создают новое задание. Числовые литералы сохраняются как в запросе, поэтому `1` и `1.0` — разное содержимое и дают `409`.
+## Processing overview
 
-`payload` хранится как PostgreSQL `json`, поэтому текст объекта читается обратно в исходном виде. Сравнение идемпотентности идёт по хешу.
+1. Scheduler moves due `scheduled` jobs to `queued` and inserts outbox rows in one transaction.
+2. Outbox loop publishes `job_id` to JetStream outside any DB transaction.
+3. Workers claim `queued` → `processing`, record `send_started_at` per `send_attempt_id`, call mock, then finish.
+4. While handling a message, workers send JetStream **InProgress** periodically (10s in production) to extend `AckWait`.
 
-## Путь задания
+Worker skips terminal states (`succeeded`, `failed`, **`canceled`**) with Ack and no send.
 
-Планировщик раз в секунду (`SCHEDULER_INTERVAL`) выбирает до 100 записей, у которых `scheduled_at <= now()` базы. В одной транзакции он ставит состояние `queued` и добавляет строку outbox. В NATS из этой транзакции ничего не публикуется.
+## Demo scripts
 
-Отдельный цикл раз в 500 мс читает ещё не подтверждённые строки outbox, публикует текст `job_id` в `jobs.dispatch` и только после подтверждения JetStream заполняет `published_at`. Транзакция базы на время публикации не удерживается. Строка outbox не удаляется. Рассчитано на одного публикатора: второй процесс мог бы отправить ту же строку дважды. Повтор той же публикации в течение двух минут использует тот же `Nats-Msg-Id` (id строки outbox). Воркер дополнительно не вызывает отправителя для уже завершённого задания.
+```bash
+python3 scripts/demo.py          # timing and idempotency
+python3 scripts/demo_cancel.py   # one job runs, one is canceled (API checks only)
+```
 
-Если NATS недоступен, строка outbox остаётся без `published_at`. Следующие проходы повторяют публикацию.
+Demos verify statuses and timestamps via GET; they do not count mock sender calls (integration tests do that with `recordingSender`).
 
-Сообщения JetStream не удаляются по возрасту. Ограничение в 24 часа снято: иначе необработанное сообщение исчезло бы через сутки, хотя outbox уже отмечен опубликованным, и задание осталось бы в `queued`. При старте прежний предел возраста у существующего потока снимается. Окно дедупликации публикации — две минуты. Политику очистки согласуем отдельно.
-
-Два воркера читают один durable consumer `workers`. Начало выполнения — условный `UPDATE` из состояния `queued` в `processing`. Непосредственно перед вызовом mock в базе записывается `send_started_at = now()`. После успеха состояние становится `succeeded`. Ошибка отправителя завершает задание как `failed` и записывает `last_error`. Это не политика повторов целевого MVP: рабочий mock ошибку не возвращает.
-
-`scheduled_at` означает «не начинать раньше». Дополнительная задержка зависит от интервалов опроса и нагрузки. Жёсткого SLA нет. Момент «время наступило» определяет `now()` PostgreSQL.
-
-## Повторная доставка и недоступная база
-
-| Состояние при получении `job_id` | Действие |
-|---|---|
-| `queued`, условный захват удался | записать `send_started_at`, вызвать mock, сохранить результат, Ack |
-| `succeeded` или `failed` | Ack, mock не вызывать |
-| `processing`, `send_started_at` пустой | повторить запись `send_started_at` для той же `send_attempt_id` и вызвать mock один раз |
-| `processing`, `send_started_at` уже есть | Nak с задержкой, mock не вызывать. Другая попытка или процесс уже начал отправку |
-| строки нет или состояние неожиданное | Ack и запись в журнал |
-| база недоступна до захвата | несколько попыток внутри текущей доставки, затем Nak с задержкой |
-
-Паузы между попытками в одной доставке: 200 мс, 500 мс, 1 с, 2 с. Первая попытка выполняется сразу. Короткий обрыв в пределах этой суммы не тратит ещё одну доставку JetStream.
-
-Если база всё ещё недоступна, сообщение возвращается через `NakWithDelay(5s)`. `AckWait` — 30 с, `MaxDeliver` — 20. Двадцать доставок с паузой 5 с покрывают больше минуты недоступности. После исчерпания `MaxDeliver` брокер убирает сообщение, и задание может остаться в `queued`.
-
-Пока воркер выполняет захваченное задание или сохраняет результат, он периодически отправляет JetStream `InProgress` (интервал 10 с, меньше `AckWait`). Это продлевает таймер подтверждения и не даёт брокеру тратить `MaxDeliver` на повторные доставки живой обработки. Сигналы прекращаются после `Ack`, `Nak` или отмены рабочего контекста.
-
-Ошибка после захвата не подтверждается через Nak, пока mock уже вызван: тот же воркер повторяет `Finish` с паузой, сообщение JetStream остаётся неподтверждённым, отправитель второй раз не вызывается. Ожидание прерывается при завершении процесса.
-
-При захвате в базе создаётся `send_attempt_id`. Запись `send_started_at` идемпотентна для этой попытки: если SQL выполнился, а клиент получил сетевую ошибку, повтор с тем же `send_attempt_id` не считается чужой попыткой и не подтверждает сообщение без вызова mock.
-
-Если процесс остановился после вызова mock, результат в базе не сохранён, а `send_started_at` уже заполнен, задание остаётся в `processing`. Это восстановление остаётся на следующую итерацию.
-
-## Проверки
+## Tests
 
 ```bash
 gofmt -w .
-go test ./...
-go test -tags=integration -count=1 -timeout 15m ./...
+GOTOOLCHAIN=local go test ./...
+GOTOOLCHAIN=local go test -tags=integration -count=1 -timeout 20m ./...
 ```
 
-Интеграционные тесты поднимают настоящие PostgreSQL и NATS. Они проверяют конкурентную идемпотентность, отсутствие раннего вызова mock (`send_started_at >= scheduled_at` и счётчик вызовов), гонку двух воркеров до записи `send_started_at` (ровно один вызов отправителя), сохранение результата дольше `AckWait` без повторной отправки, повторную доставку с новым идентификатором сообщения, восстановление после недоступности базы до захвата, до вызова mock и при сохранении результата без повторной доставки, потерю ответа на запись `send_started_at`, восстановление после недоступности NATS, а также обработку пачки двумя воркерами.
+Integration tests use paused worker claims, API assertions for cancel, race tests from guaranteed `queued`, and sender call counts.
 
-## Ограничения первой итерации
+## Known limitations
 
-- Отмена задания и кампании отсутствуют.
-- Шаблоны и подстановка переменных отсутствуют.
-- Ошибка отправителя не ставится в очередь на повтор.
-- Нет восстановления после остановки процесса, если отправитель уже мог быть вызван: задание остаётся в `processing`. Перед завершением MVP это отдельный шаг. Временный отказ базы при живом процессе сюда не входит.
-- Работает один публикатор outbox.
-- JSON-числа `1` и `1.0` считаются разным содержимым.
-- Нет авторизации, метрик и интерфейса пользователя.
+- No campaigns or template variables
+- No automatic retry on sender failure
+- No recovery if a worker dies in `processing` after send may have started
+- Single outbox publisher assumed
+- JSON numbers `1` and `1.0` are different content for idempotency

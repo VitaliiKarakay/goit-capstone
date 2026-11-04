@@ -136,7 +136,7 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 // attempt owns the job or a previous process died after marking start.
 func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
 	switch job.Status {
-	case domain.StatusSucceeded, domain.StatusFailed:
+	case domain.StatusSucceeded, domain.StatusFailed, domain.StatusCanceled:
 		r.log.Info("skip terminal duplicate", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
 		_ = msg.Ack()
 	case domain.StatusProcessing:

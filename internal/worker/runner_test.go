@@ -68,6 +68,18 @@ func TestHandleSkipsTerminalDuplicate(t *testing.T) {
 	}
 }
 
+func TestHandleSkipsCanceled(t *testing.T) {
+	job := sampleJob()
+	job.Status = domain.StatusCanceled
+	store := &fakeStore{found: true, job: job}
+	send := &fakeSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	testRunner(store, send).handle(context.Background(), msg.data, msg)
+	if send.calls != 0 || msg.acks != 1 {
+		t.Fatalf("calls=%d acks=%d", send.calls, msg.acks)
+	}
+}
+
 func TestHandleRetriesMarkAfterClaimWithoutSendingEarly(t *testing.T) {
 	job := sampleJob()
 	store := &fakeStore{found: true, claimed: true, job: job, markErr: dialErr()}

@@ -71,6 +71,53 @@ func TestGetUnknownJob(t *testing.T) {
 	}
 }
 
+func TestCancelJob(t *testing.T) {
+	store := &memStore{}
+	api := NewAPI(slog.New(slog.DiscardHandler), store)
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	body := validBody(time.Now().Add(time.Hour))
+	created := do(t, server.URL, body)
+	id, _ := created.job["id"].(string)
+
+	code, resp := cancel(t, server.URL, id, "")
+	if code != http.StatusOK || resp["result"] != "canceled" || resp["status"] != "canceled" {
+		t.Fatalf("cancel = %d %v", code, resp)
+	}
+	code, resp = cancel(t, server.URL, id, "")
+	if code != http.StatusOK || resp["result"] != "already_canceled" {
+		t.Fatalf("second cancel = %d %v", code, resp)
+	}
+	store.saved.Status = domain.StatusProcessing
+	code, _ = cancel(t, server.URL, id, "")
+	if code != http.StatusConflict {
+		t.Fatalf("late cancel = %d", code)
+	}
+	code, _ = cancel(t, server.URL, uuid.NewString(), "")
+	if code != http.StatusNotFound {
+		t.Fatalf("unknown cancel = %d", code)
+	}
+	code, _ = cancel(t, server.URL, id, `{}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("body cancel = %d", code)
+	}
+}
+
+func TestCancelReplaysCanceledCreate(t *testing.T) {
+	store := &memStore{}
+	server := httptest.NewServer(NewAPI(slog.New(slog.DiscardHandler), store).Handler())
+	defer server.Close()
+	body := validBody(time.Now().Add(time.Hour))
+	created := do(t, server.URL, body)
+	id := created.job["id"].(string)
+	cancel(t, server.URL, id, "")
+	replay := do(t, server.URL, body)
+	if replay.StatusCode != http.StatusOK || replay.job["id"] != id || replay.job["status"] != "canceled" {
+		t.Fatalf("replay = %d %v", replay.StatusCode, replay.job)
+	}
+}
+
 func post(t *testing.T, body string) (int, string) {
 	t.Helper()
 	api := NewAPI(slog.New(slog.DiscardHandler), &memStore{})
@@ -100,6 +147,26 @@ func do(t *testing.T, base, body string) httpResult {
 	var payload map[string]any
 	_ = json.Unmarshal(raw, &payload)
 	return httpResult{StatusCode: res.StatusCode, raw: string(raw), job: payload}
+}
+
+func cancel(t *testing.T, base, id, body string) (int, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, base+"/jobs/"+id+"/cancel", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(raw, &payload)
+	return res.StatusCode, payload
 }
 
 func validBody(at time.Time) string {
@@ -146,4 +213,22 @@ func (m *memStore) GetJob(_ context.Context, id uuid.UUID) (domain.Job, error) {
 		return domain.Job{}, domain.ErrNotFound
 	}
 	return m.saved, nil
+}
+
+func (m *memStore) CancelJob(_ context.Context, id uuid.UUID) (domain.Job, domain.CancelOutcome, error) {
+	if m.saved.ID != id {
+		return domain.Job{}, "", domain.ErrNotFound
+	}
+	switch m.saved.Status {
+	case domain.StatusCanceled:
+		return m.saved, domain.CancelOutcomeAlreadyCanceled, nil
+	case domain.StatusScheduled, domain.StatusQueued:
+		now := time.Now().UTC()
+		m.saved.Status = domain.StatusCanceled
+		m.saved.CanceledAt = &now
+		m.saved.UpdatedAt = now
+		return m.saved, domain.CancelOutcomeCanceled, nil
+	default:
+		return domain.Job{}, "", domain.ErrTooLate
+	}
 }

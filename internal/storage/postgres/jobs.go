@@ -12,7 +12,7 @@ import (
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 )
 
-const jobColumns = `id::text, idempotency_key, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, send_attempt_id::text, created_at, updated_at, finished_at`
+const jobColumns = `id::text, idempotency_key, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, send_attempt_id::text, canceled_at, created_at, updated_at, finished_at`
 
 type OutboxMessage struct {
 	ID    int64
@@ -50,6 +50,49 @@ func (s *Store) GetJob(ctx context.Context, id uuid.UUID) (domain.Job, error) {
 		return domain.Job{}, domain.ErrNotFound
 	}
 	return job, err
+}
+
+// CancelJob transitions scheduled or queued jobs to canceled. It races with Claim on queued rows.
+func (s *Store) CancelJob(ctx context.Context, id uuid.UUID) (domain.Job, domain.CancelOutcome, error) {
+	job, err := scanJob(s.pool.QueryRow(ctx, `
+		UPDATE jobs
+		SET status = 'canceled', canceled_at = now(), updated_at = now()
+		WHERE id = $1::uuid AND status IN ('scheduled', 'queued')
+		RETURNING `+jobColumns, id.String()))
+	if err == nil {
+		return job, domain.CancelOutcomeCanceled, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.Job{}, "", err
+	}
+	job, err = s.GetJob(ctx, id)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.Job{}, "", domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.Job{}, "", err
+	}
+	switch job.Status {
+	case domain.StatusCanceled:
+		return job, domain.CancelOutcomeAlreadyCanceled, nil
+	case domain.StatusProcessing, domain.StatusSucceeded, domain.StatusFailed:
+		return domain.Job{}, "", domain.ErrTooLate
+	case domain.StatusScheduled, domain.StatusQueued:
+		job, err = scanJob(s.pool.QueryRow(ctx, `
+			UPDATE jobs
+			SET status = 'canceled', canceled_at = now(), updated_at = now()
+			WHERE id = $1::uuid AND status IN ('scheduled', 'queued')
+			RETURNING `+jobColumns, id.String()))
+		if err == nil {
+			return job, domain.CancelOutcomeCanceled, nil
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Job{}, "", domain.ErrTooLate
+		}
+		return domain.Job{}, "", err
+	default:
+		return domain.Job{}, "", domain.ErrTooLate
+	}
 }
 
 func (s *Store) QueueDue(ctx context.Context, limit int) (int, error) {
@@ -216,7 +259,7 @@ func (s *Store) jobByKey(ctx context.Context, key string) (domain.Job, []byte, e
 	var hash []byte
 	err := row.Scan(
 		&id, &job.IdempotencyKey, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
-		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &hash,
+		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CanceledAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &hash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Job{}, nil, domain.ErrNotFound
@@ -243,7 +286,7 @@ func scanJob(row pgx.Row) (domain.Job, error) {
 	var attempt *string
 	err := row.Scan(
 		&id, &job.IdempotencyKey, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
-		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt,
+		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CanceledAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt,
 	)
 	if err != nil {
 		return domain.Job{}, err

@@ -793,6 +793,18 @@ type faultStore struct {
 	failFinish       atomic.Bool
 	loseMarkResponse atomic.Bool
 	markSleep        atomic.Int64
+	pauseClaim       atomic.Bool
+}
+
+func (s *faultStore) Claim(ctx context.Context, id uuid.UUID, workerID string) (domain.Job, bool, bool, error) {
+	for s.pauseClaim.Load() {
+		select {
+		case <-ctx.Done():
+			return domain.Job{}, false, false, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	return s.Store.Claim(ctx, id, workerID)
 }
 
 func (s *faultStore) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error) {

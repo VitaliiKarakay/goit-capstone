@@ -62,8 +62,8 @@ def main():
         "sender": "mock",
         "payload": {
             "to": "user@example.com",
-            "subject": "Нагадування",
-            "body": "Демонстраційне повідомлення",
+            "subject": "Reminder",
+            "body": "Demo message",
         },
     }
     status, created = request("POST", "/jobs", body)
@@ -106,7 +106,7 @@ def main():
     print("idempotent replay returned the same id")
 
     conflict = dict(body)
-    conflict["payload"] = dict(body["payload"], subject="Інша тема")
+    conflict["payload"] = dict(body["payload"], subject="Other subject")
     status, payload = request("POST", "/jobs", conflict)
     if status != 409 or payload.get("error", {}).get("code") != "idempotency_conflict":
         fail(f"conflict was not reported: {status} {payload}")
