@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+      POSTGRES_DB: scheduler
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  nats:
+    image: nats:2.15.2-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  migrate:
+    build:
+      context: .
+      target: controller
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  controller:
+    build:
+      context: .
+      target: controller
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+      NATS_URL: nats://nats:4222
+      SCHEDULER_INTERVAL: 1s
+      SCHEDULER_BATCH: "100"
+      OUTBOX_INTERVAL: 500ms
+      OUTBOX_BATCH: "50"
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: worker
+    environment:
+      DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+      NATS_URL: nats://nats:4222
+      LOG_LEVEL: info
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  natsdata:
