@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,7 +14,6 @@ import (
 
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 	"github.com/VitaliiKarakay/goit-capstone/internal/sender"
-	"github.com/VitaliiKarakay/goit-capstone/internal/storage/postgres"
 )
 
 type Store interface {
@@ -26,6 +26,11 @@ type Stats struct {
 	DelayedNak atomic.Int64
 }
 
+type sendResult struct {
+	status domain.Status
+	last   *string
+}
+
 type Runner struct {
 	log         *slog.Logger
 	store       Store
@@ -34,9 +39,12 @@ type Runner struct {
 	retryDelays []time.Duration
 	nakDelay    time.Duration
 	Stats       Stats
+
+	mu      sync.Mutex
+	results map[uuid.UUID]sendResult
 }
 
-func New(log *slog.Logger, store *postgres.Store, send sender.Sender, workerID string) *Runner {
+func New(log *slog.Logger, store Store, send sender.Sender, workerID string) *Runner {
 	return &Runner{
 		log:         log,
 		store:       store,
@@ -44,6 +52,7 @@ func New(log *slog.Logger, store *postgres.Store, send sender.Sender, workerID s
 		workerID:    workerID,
 		retryDelays: DBRetryDelays,
 		nakDelay:    NakDelay,
+		results:     map[uuid.UUID]sendResult{},
 	}
 }
 
@@ -117,22 +126,55 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 		return
 	}
 	if !found {
+		r.dropResult(id)
 		r.log.Error("job not found", "job_id", id.String(), "worker_id", r.workerID)
 		_ = msg.Ack()
 		return
 	}
 	if !claimed {
-		r.ackWithoutSend(msg, job)
+		r.followUp(ctx, msg, job)
 		return
 	}
+	r.attempt(ctx, msg, job)
+}
 
-	err = retryDB(ctx, r.retryDelays, func() error {
+// followUp continues a job that is already claimed. A missing send_started_at
+// means the sender has not been called. A saved result means this process
+// already called the sender and only the database write must be repeated.
+// A result that exists only in a stopped process is left for a later iteration.
+func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
+	switch job.Status {
+	case domain.StatusSucceeded, domain.StatusFailed:
+		r.dropResult(job.ID)
+		r.log.Info("skip terminal duplicate", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
+		_ = msg.Ack()
+	case domain.StatusProcessing:
+		if job.SendStartedAt == nil {
+			r.attempt(ctx, msg, job)
+			return
+		}
+		status, last, ok := r.resultOf(job.ID)
+		if !ok {
+			r.delay(msg, job.ID, "resume finish", errors.New("send result is not on this worker"))
+			return
+		}
+		r.persist(ctx, msg, job.ID, status, last)
+	default:
+		r.log.Error("skip unexpected status", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
+		_ = msg.Ack()
+	}
+}
+
+func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
+	id := job.ID
+	err := retryDB(ctx, r.retryDelays, func() error {
 		_, markErr := r.store.MarkSendStarted(ctx, id)
 		return markErr
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNotProcessing) {
-			r.ackWithoutSend(msg, domain.Job{ID: id, Status: domain.StatusProcessing})
+			r.log.Info("send start already recorded", "job_id", id.String(), "worker_id", r.workerID)
+			_ = msg.Ack()
 			return
 		}
 		if ctx.Err() != nil {
@@ -151,11 +193,16 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 		lastError = &text
 		r.log.Error("sender failed", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
 	}
+	r.saveResult(id, status, lastError)
+	r.persist(ctx, msg, id, status, lastError)
+}
 
-	err = retryDB(ctx, r.retryDelays, func() error {
+func (r *Runner) persist(ctx context.Context, msg ackMessage, id uuid.UUID, status domain.Status, lastError *string) {
+	err := retryDB(ctx, r.retryDelays, func() error {
 		return r.store.Finish(ctx, id, status, lastError)
 	})
 	if errors.Is(err, domain.ErrNotProcessing) {
+		r.dropResult(id)
 		r.log.Info("result already recorded", "job_id", id.String(), "worker_id", r.workerID)
 		_ = msg.Ack()
 		return
@@ -164,22 +211,39 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 		if ctx.Err() != nil {
 			return
 		}
+		r.saveResult(id, status, lastError)
 		r.delay(msg, id, "finish", err)
 		return
 	}
+	r.dropResult(id)
 	_ = msg.Ack()
 }
 
-func (r *Runner) ackWithoutSend(msg ackMessage, job domain.Job) {
-	switch job.Status {
-	case domain.StatusSucceeded, domain.StatusFailed:
-		r.log.Info("skip terminal duplicate", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
-	case domain.StatusProcessing:
-		r.log.Info("skip processing duplicate", "job_id", job.ID.String(), "worker_id", r.workerID)
-	default:
-		r.log.Error("skip unexpected status", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
+func (r *Runner) saveResult(id uuid.UUID, status domain.Status, last *string) {
+	var copied *string
+	if last != nil {
+		text := *last
+		copied = &text
 	}
-	_ = msg.Ack()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.results == nil {
+		r.results = map[uuid.UUID]sendResult{}
+	}
+	r.results[id] = sendResult{status: status, last: copied}
+}
+
+func (r *Runner) resultOf(id uuid.UUID) (domain.Status, *string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res, ok := r.results[id]
+	return res.status, res.last, ok
+}
+
+func (r *Runner) dropResult(id uuid.UUID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.results, id)
 }
 
 func (r *Runner) delay(msg ackMessage, id uuid.UUID, op string, err error) {

@@ -3,6 +3,8 @@ package domain
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -33,7 +35,10 @@ func ParseCreate(body []byte, now time.Time) (NewJob, error) {
 		}
 		return NewJob{}, InvalidJSON("request body must be a single JSON object")
 	}
-	if dec.More() {
+	// More reports another array or object element. It does not detect trailing
+	// tokens after the value, so a second decode must end with EOF.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return NewJob{}, InvalidJSON("request body must contain a single JSON object")
 	}
 

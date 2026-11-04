@@ -68,21 +68,8 @@ func (b *Bus) Close() {
 }
 
 func (b *Bus) Ensure(ctx context.Context, ackWait time.Duration, maxDeliver int) error {
-	if _, err := b.js.StreamInfo(Stream); err != nil {
-		if !errors.Is(err, nats.ErrStreamNotFound) {
-			return err
-		}
-		_, err = b.js.AddStream(&nats.StreamConfig{
-			Name:       Stream,
-			Subjects:   []string{Subject},
-			Retention:  nats.WorkQueuePolicy,
-			Storage:    nats.FileStorage,
-			Duplicates: 2 * time.Minute,
-			MaxAge:     24 * time.Hour,
-		}, nats.Context(ctx))
-		if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
-			return err
-		}
+	if err := b.ensureStream(ctx); err != nil {
+		return err
 	}
 	if _, err := b.js.ConsumerInfo(Stream, Durable); err != nil {
 		if !errors.Is(err, nats.ErrConsumerNotFound) {
@@ -101,6 +88,36 @@ func (b *Bus) Ensure(ctx context.Context, ackWait time.Duration, maxDeliver int)
 		}
 	}
 	return nil
+}
+
+// ensureStream keeps messages until they are acknowledged. An age limit would
+// delete a published job while the outbox row is already marked published.
+func (b *Bus) ensureStream(ctx context.Context) error {
+	cfg := &nats.StreamConfig{
+		Name:       Stream,
+		Subjects:   []string{Subject},
+		Retention:  nats.WorkQueuePolicy,
+		Storage:    nats.FileStorage,
+		Duplicates: 2 * time.Minute,
+	}
+	info, err := b.js.StreamInfo(Stream)
+	if errors.Is(err, nats.ErrStreamNotFound) {
+		_, err = b.js.AddStream(cfg, nats.Context(ctx))
+		if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Config.MaxAge == 0 {
+		return nil
+	}
+	updated := info.Config
+	updated.MaxAge = 0
+	_, err = b.js.UpdateStream(&updated, nats.Context(ctx))
+	return err
 }
 
 func (b *Bus) PublishJob(ctx context.Context, jobID uuid.UUID, messageID string) error {

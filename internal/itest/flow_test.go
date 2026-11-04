@@ -5,6 +5,7 @@ package itest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -199,6 +201,81 @@ func TestRecoversAfterDatabaseOutage(t *testing.T) {
 	}
 }
 
+func TestRecoversWhenDatabaseFailsBeforeSend(t *testing.T) {
+	env.fault.failMark.Store(true)
+	t.Cleanup(func() { env.fault.failMark.Store(false) })
+	before := env.naks()
+	body := jobBody("mark-"+uuid.NewString(), "user-mark", time.Now().Add(-time.Second), "before-send")
+	_, id, err := env.post(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.MustParse(id)
+
+	deadline := time.Now().Add(20 * time.Second)
+	var job map[string]any
+	for time.Now().Before(deadline) {
+		job = env.get(t, id)
+		if env.rec.count(jobID) != 0 {
+			t.Fatal("sender was called before send_started_at was saved")
+		}
+		if job["status"] == "processing" && job["send_started_at"] == nil && env.naks() > before {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if job["status"] != "processing" || job["send_started_at"] != nil || env.naks() == before {
+		t.Fatalf("job did not stay claimed before send: %+v naks=%d", job, env.naks()-before)
+	}
+
+	env.fault.failMark.Store(false)
+	env.waitStatus(t, id, "succeeded", 30*time.Second)
+	if env.rec.count(jobID) != 1 {
+		t.Fatalf("sender calls = %d", env.rec.count(jobID))
+	}
+}
+
+func TestRecoversWhenDatabaseFailsWhileSavingResult(t *testing.T) {
+	env.fault.failFinish.Store(true)
+	t.Cleanup(func() { env.fault.failFinish.Store(false) })
+	before := env.naks()
+	body := jobBody("finish-"+uuid.NewString(), "user-finish", time.Now().Add(-time.Second), "save-result")
+	_, id, err := env.post(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.MustParse(id)
+
+	deadline := time.Now().Add(30 * time.Second)
+	var job map[string]any
+	for time.Now().Before(deadline) {
+		job = env.get(t, id)
+		if job["status"] == "processing" && job["send_started_at"] != nil && env.rec.count(jobID) == 1 && env.naks() > before {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if env.rec.count(jobID) != 1 || job["status"] != "processing" || job["send_started_at"] == nil || env.naks() == before {
+		t.Fatalf("result was not left unsaved: %+v calls=%d naks=%d", job, env.rec.count(jobID), env.naks()-before)
+	}
+	redelivered := time.Now().Add(20 * time.Second)
+	for time.Now().Before(redelivered) && env.naks() < before+2 {
+		if env.rec.count(jobID) != 1 {
+			t.Fatalf("sender calls during redelivery = %d", env.rec.count(jobID))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if env.naks() < before+2 || env.rec.count(jobID) != 1 {
+		t.Fatalf("redelivery calls=%d naks=%d", env.rec.count(jobID), env.naks()-before)
+	}
+
+	env.fault.failFinish.Store(false)
+	env.waitStatus(t, id, "succeeded", 40*time.Second)
+	if env.rec.count(jobID) != 1 {
+		t.Fatalf("sender calls = %d", env.rec.count(jobID))
+	}
+}
+
 func TestOutboxSurvivesNATSOutage(t *testing.T) {
 	env.natsProxy.reject(true)
 	t.Cleanup(func() { env.natsProxy.reject(false) })
@@ -285,6 +362,7 @@ type environment struct {
 	db        *pgxpool.Pool
 	direct    *postgres.Store
 	workers   *postgres.Store
+	fault     *faultStore
 	dbProxy   *proxy
 	natsProxy *proxy
 	js        nats.JetStreamContext
@@ -349,6 +427,8 @@ func startEnv(ctx context.Context) (*environment, error) {
 	if err != nil {
 		return nil, err
 	}
+	fault := &faultStore{Store: workerDB}
+	e.fault = fault
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
@@ -379,7 +459,7 @@ func startEnv(ctx context.Context) (*environment, error) {
 			cancel()
 			return nil, err
 		}
-		runner := worker.New(log, workerDB, recordingSender{workerID: id, rec: rec}, id)
+		runner := worker.New(log, fault, recordingSender{workerID: id, rec: rec}, id)
 		go func() { _ = runner.Run(appCtx, appCtx, wbus.Pull) }()
 		runners = append(runners, runner)
 	}
@@ -560,6 +640,30 @@ func mustTime(t *testing.T, v any) time.Time {
 		t.Fatal(err)
 	}
 	return parsed
+}
+
+type faultStore struct {
+	*postgres.Store
+	failMark   atomic.Bool
+	failFinish atomic.Bool
+}
+
+func (s *faultStore) MarkSendStarted(ctx context.Context, id uuid.UUID) (time.Time, error) {
+	if s.failMark.Load() {
+		return time.Time{}, dbDown()
+	}
+	return s.Store.MarkSendStarted(ctx, id)
+}
+
+func (s *faultStore) Finish(ctx context.Context, id uuid.UUID, status domain.Status, lastError *string) error {
+	if s.failFinish.Load() {
+		return dbDown()
+	}
+	return s.Store.Finish(ctx, id, status, lastError)
+}
+
+func dbDown() error {
+	return &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
 }
 
 type recordingSender struct {

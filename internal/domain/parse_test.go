@@ -89,6 +89,13 @@ func TestParseCreateNormalizesTimeAndAcceptsPast(t *testing.T) {
 	if !bytes.Equal(job.ContentHash, again.ContentHash) {
 		t.Fatal("hash was not stable")
 	}
+	spaced, err := ParseCreate(append(append([]byte{}, body...), '\n', '\t', ' '), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(job.ContentHash, spaced.ContentHash) {
+		t.Fatal("trailing whitespace changed the request")
+	}
 }
 
 func TestParseCreateRejects(t *testing.T) {
@@ -107,6 +114,9 @@ func TestParseCreateRejects(t *testing.T) {
 		field string
 	}{
 		{name: "trailing object", body: valid + `{"x":1}`, code: "invalid_json"},
+		{name: "trailing brace", body: valid + `}`, code: "invalid_json"},
+		{name: "trailing bracket", body: valid + `]`, code: "invalid_json"},
+		{name: "trailing garbage", body: valid + `oops`, code: "invalid_json"},
 		{name: "unknown field", body: strings.Replace(valid, `"sender"`, `"extra":1,"sender"`, 1), code: "validation_error", field: "body"},
 		{name: "bad sender", body: strings.Replace(valid, `"mock"`, `"smtp"`, 1), code: "validation_error", field: "sender"},
 		{name: "no zone", body: strings.Replace(valid, `"2026-11-03T12:00:00Z"`, `"2026-11-03T12:00:00"`, 1), code: "validation_error", field: "scheduled_at"},
