@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,17 +17,12 @@ import (
 
 type Store interface {
 	Claim(ctx context.Context, id uuid.UUID, workerID string) (domain.Job, bool, bool, error)
-	MarkSendStarted(ctx context.Context, id uuid.UUID) (time.Time, error)
+	MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error)
 	Finish(ctx context.Context, id uuid.UUID, status domain.Status, lastError *string) error
 }
 
 type Stats struct {
 	DelayedNak atomic.Int64
-}
-
-type sendResult struct {
-	status domain.Status
-	last   *string
 }
 
 type Runner struct {
@@ -39,9 +33,6 @@ type Runner struct {
 	retryDelays []time.Duration
 	nakDelay    time.Duration
 	Stats       Stats
-
-	mu      sync.Mutex
-	results map[uuid.UUID]sendResult
 }
 
 func New(log *slog.Logger, store Store, send sender.Sender, workerID string) *Runner {
@@ -52,7 +43,6 @@ func New(log *slog.Logger, store Store, send sender.Sender, workerID string) *Ru
 		workerID:    workerID,
 		retryDelays: DBRetryDelays,
 		nakDelay:    NakDelay,
-		results:     map[uuid.UUID]sendResult{},
 	}
 }
 
@@ -126,7 +116,6 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 		return
 	}
 	if !found {
-		r.dropResult(id)
 		r.log.Error("job not found", "job_id", id.String(), "worker_id", r.workerID)
 		_ = msg.Ack()
 		return
@@ -138,27 +127,24 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 	r.attempt(ctx, msg, job)
 }
 
-// followUp continues a job that is already claimed. A missing send_started_at
-// means the sender has not been called. A saved result means this process
-// already called the sender and only the database write must be repeated.
-// A result that exists only in a stopped process is left for a later iteration.
+// followUp continues processing for this delivery. send_started_at must stay empty
+// until the sender runs, so a filled timestamp with no local send means another
+// attempt owns the job or a previous process died after marking start.
 func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
 	switch job.Status {
 	case domain.StatusSucceeded, domain.StatusFailed:
-		r.dropResult(job.ID)
 		r.log.Info("skip terminal duplicate", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
 		_ = msg.Ack()
 	case domain.StatusProcessing:
-		if job.SendStartedAt == nil {
-			r.attempt(ctx, msg, job)
+		if job.SendStartedAt != nil {
+			r.delay(msg, job.ID, "resume processing", errors.New("send already started on another attempt"))
 			return
 		}
-		status, last, ok := r.resultOf(job.ID)
-		if !ok {
-			r.delay(msg, job.ID, "resume finish", errors.New("send result is not on this worker"))
+		if job.SendAttemptID == nil {
+			r.delay(msg, job.ID, "resume processing", errors.New("missing send attempt id"))
 			return
 		}
-		r.persist(ctx, msg, job.ID, status, last)
+		r.attempt(ctx, msg, job)
 	default:
 		r.log.Error("skip unexpected status", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
 		_ = msg.Ack()
@@ -166,15 +152,21 @@ func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
 }
 
 func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
+	if job.SendAttemptID == nil {
+		r.log.Error("missing send attempt", "job_id", job.ID.String(), "worker_id", r.workerID)
+		_ = msg.Ack()
+		return
+	}
+	attempt := *job.SendAttemptID
 	id := job.ID
+
 	err := retryDB(ctx, r.retryDelays, func() error {
-		_, markErr := r.store.MarkSendStarted(ctx, id)
+		_, markErr := r.store.MarkSendStarted(ctx, id, attempt)
 		return markErr
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNotProcessing) {
-			r.log.Info("send start already recorded", "job_id", id.String(), "worker_id", r.workerID)
-			_ = msg.Ack()
+			r.delay(msg, id, "mark send start", err)
 			return
 		}
 		if ctx.Err() != nil {
@@ -193,57 +185,44 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 		lastError = &text
 		r.log.Error("sender failed", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
 	}
-	r.saveResult(id, status, lastError)
-	r.persist(ctx, msg, id, status, lastError)
+	r.finishUntilDone(ctx, msg, id, status, lastError)
 }
 
-func (r *Runner) persist(ctx context.Context, msg ackMessage, id uuid.UUID, status domain.Status, lastError *string) {
-	err := retryDB(ctx, r.retryDelays, func() error {
-		return r.store.Finish(ctx, id, status, lastError)
-	})
-	if errors.Is(err, domain.ErrNotProcessing) {
-		r.dropResult(id)
-		r.log.Info("result already recorded", "job_id", id.String(), "worker_id", r.workerID)
-		_ = msg.Ack()
-		return
-	}
-	if err != nil {
+// finishUntilDone keeps the JetStream message unacked and retries Finish with
+// backoff until the database accepts the result or the work context ends.
+func (r *Runner) finishUntilDone(ctx context.Context, msg ackMessage, id uuid.UUID, status domain.Status, lastError *string) {
+	for {
+		err := retryDB(ctx, r.retryDelays, func() error {
+			return r.store.Finish(ctx, id, status, lastError)
+		})
+		if err == nil {
+			_ = msg.Ack()
+			return
+		}
+		if errors.Is(err, domain.ErrNotProcessing) {
+			r.log.Info("result already recorded", "job_id", id.String(), "worker_id", r.workerID)
+			_ = msg.Ack()
+			return
+		}
 		if ctx.Err() != nil {
 			return
 		}
-		r.saveResult(id, status, lastError)
-		r.delay(msg, id, "finish", err)
-		return
+		r.log.Error("finish failed", "job_id", id.String(), "worker_id", r.workerID, "err", err)
+		if !wait(ctx, r.nakDelay) {
+			return
+		}
 	}
-	r.dropResult(id)
-	_ = msg.Ack()
 }
 
-func (r *Runner) saveResult(id uuid.UUID, status domain.Status, last *string) {
-	var copied *string
-	if last != nil {
-		text := *last
-		copied = &text
+func wait(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.results == nil {
-		r.results = map[uuid.UUID]sendResult{}
-	}
-	r.results[id] = sendResult{status: status, last: copied}
-}
-
-func (r *Runner) resultOf(id uuid.UUID) (domain.Status, *string, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	res, ok := r.results[id]
-	return res.status, res.last, ok
-}
-
-func (r *Runner) dropResult(id uuid.UUID) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.results, id)
 }
 
 func (r *Runner) delay(msg ackMessage, id uuid.UUID, op string, err error) {

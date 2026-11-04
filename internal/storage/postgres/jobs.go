@@ -12,7 +12,7 @@ import (
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 )
 
-const jobColumns = `id::text, idempotency_key, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, created_at, updated_at, finished_at`
+const jobColumns = `id::text, idempotency_key, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, send_attempt_id::text, created_at, updated_at, finished_at`
 
 type OutboxMessage struct {
 	ID    int64
@@ -146,7 +146,7 @@ func (s *Store) MarkPublished(ctx context.Context, id int64) error {
 func (s *Store) Claim(ctx context.Context, id uuid.UUID, workerID string) (domain.Job, bool, bool, error) {
 	job, err := scanJob(s.pool.QueryRow(ctx, `
 		UPDATE jobs
-		SET status = 'processing', worker_id = $2, updated_at = now()
+		SET status = 'processing', worker_id = $2, send_attempt_id = gen_random_uuid(), updated_at = now()
 		WHERE id = $1::uuid AND status = 'queued'
 		RETURNING `+jobColumns, id.String(), workerID))
 	if err == nil {
@@ -165,18 +165,32 @@ func (s *Store) Claim(ctx context.Context, id uuid.UUID, workerID string) (domai
 	return job, true, false, nil
 }
 
-func (s *Store) MarkSendStarted(ctx context.Context, id uuid.UUID) (time.Time, error) {
+func (s *Store) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error) {
 	var started time.Time
 	err := s.pool.QueryRow(ctx, `
 		UPDATE jobs
 		SET send_started_at = now(), updated_at = now()
-		WHERE id = $1::uuid AND status = 'processing' AND send_started_at IS NULL
+		WHERE id = $1::uuid AND status = 'processing' AND send_attempt_id = $2::uuid AND send_started_at IS NULL
 		RETURNING send_started_at
-	`, id.String()).Scan(&started)
+	`, id.String(), attempt.String()).Scan(&started)
+	if err == nil {
+		return started, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, err
+	}
+	err = s.pool.QueryRow(ctx, `
+		SELECT send_started_at
+		FROM jobs
+		WHERE id = $1::uuid AND status = 'processing' AND send_attempt_id = $2::uuid AND send_started_at IS NOT NULL
+	`, id.String(), attempt.String()).Scan(&started)
+	if err == nil {
+		return started, nil
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, domain.ErrNotProcessing
 	}
-	return started, err
+	return time.Time{}, err
 }
 
 func (s *Store) Finish(ctx context.Context, id uuid.UUID, status domain.Status, lastError *string) error {
@@ -198,10 +212,11 @@ func (s *Store) jobByKey(ctx context.Context, key string) (domain.Job, []byte, e
 	row := s.pool.QueryRow(ctx, `SELECT `+jobColumns+`, content_hash FROM jobs WHERE idempotency_key = $1`, key)
 	var job domain.Job
 	var id, payload, status string
+	var attempt *string
 	var hash []byte
 	err := row.Scan(
 		&id, &job.IdempotencyKey, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
-		&job.WorkerID, &job.LastError, &job.SendStartedAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &hash,
+		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &hash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Job{}, nil, domain.ErrNotFound
@@ -216,15 +231,19 @@ func (s *Store) jobByKey(ctx context.Context, key string) (domain.Job, []byte, e
 	job.ID = parsed
 	job.Payload = []byte(payload)
 	job.Status = domain.Status(status)
+	if err := scanAttempt(attempt, &job); err != nil {
+		return domain.Job{}, nil, err
+	}
 	return job, hash, nil
 }
 
 func scanJob(row pgx.Row) (domain.Job, error) {
 	var job domain.Job
 	var id, payload, status string
+	var attempt *string
 	err := row.Scan(
 		&id, &job.IdempotencyKey, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
-		&job.WorkerID, &job.LastError, &job.SendStartedAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt,
+		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt,
 	)
 	if err != nil {
 		return domain.Job{}, err
@@ -236,5 +255,20 @@ func scanJob(row pgx.Row) (domain.Job, error) {
 	job.ID = parsed
 	job.Payload = []byte(payload)
 	job.Status = domain.Status(status)
+	if err := scanAttempt(attempt, &job); err != nil {
+		return domain.Job{}, err
+	}
 	return job, nil
+}
+
+func scanAttempt(raw *string, job *domain.Job) error {
+	if raw == nil || *raw == "" {
+		return nil
+	}
+	parsed, err := uuid.Parse(*raw)
+	if err != nil {
+		return err
+	}
+	job.SendAttemptID = &parsed
+	return nil
 }

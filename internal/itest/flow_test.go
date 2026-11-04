@@ -238,7 +238,7 @@ func TestRecoversWhenDatabaseFailsBeforeSend(t *testing.T) {
 func TestRecoversWhenDatabaseFailsWhileSavingResult(t *testing.T) {
 	env.fault.failFinish.Store(true)
 	t.Cleanup(func() { env.fault.failFinish.Store(false) })
-	before := env.naks()
+	beforeNaks := env.naks()
 	body := jobBody("finish-"+uuid.NewString(), "user-finish", time.Now().Add(-time.Second), "save-result")
 	_, id, err := env.post(body)
 	if err != nil {
@@ -250,27 +250,35 @@ func TestRecoversWhenDatabaseFailsWhileSavingResult(t *testing.T) {
 	var job map[string]any
 	for time.Now().Before(deadline) {
 		job = env.get(t, id)
-		if job["status"] == "processing" && job["send_started_at"] != nil && env.rec.count(jobID) == 1 && env.naks() > before {
+		if job["status"] == "processing" && job["send_started_at"] != nil && env.rec.count(jobID) == 1 {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if env.rec.count(jobID) != 1 || job["status"] != "processing" || job["send_started_at"] == nil || env.naks() == before {
-		t.Fatalf("result was not left unsaved: %+v calls=%d naks=%d", job, env.rec.count(jobID), env.naks()-before)
+	if env.rec.count(jobID) != 1 || job["status"] != "processing" || job["send_started_at"] == nil {
+		t.Fatalf("send was not recorded before finish: %+v calls=%d", job, env.rec.count(jobID))
 	}
-	redelivered := time.Now().Add(20 * time.Second)
-	for time.Now().Before(redelivered) && env.naks() < before+2 {
-		if env.rec.count(jobID) != 1 {
-			t.Fatalf("sender calls during redelivery = %d", env.rec.count(jobID))
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if env.naks() < before+2 || env.rec.count(jobID) != 1 {
-		t.Fatalf("redelivery calls=%d naks=%d", env.rec.count(jobID), env.naks()-before)
+	if env.naks() != beforeNaks {
+		t.Fatalf("finish retry returned the message to the broker: naks=%d", env.naks()-beforeNaks)
 	}
 
 	env.fault.failFinish.Store(false)
 	env.waitStatus(t, id, "succeeded", 40*time.Second)
+	if env.rec.count(jobID) != 1 {
+		t.Fatalf("sender calls = %d", env.rec.count(jobID))
+	}
+}
+
+func TestMarkSendStartedSurvivesLostResponse(t *testing.T) {
+	env.fault.loseMarkResponse.Store(true)
+	t.Cleanup(func() { env.fault.loseMarkResponse.Store(false) })
+	body := jobBody("marklost-"+uuid.NewString(), "user-marklost", time.Now().Add(-time.Second), "lost-response")
+	_, id, err := env.post(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.MustParse(id)
+	env.waitStatus(t, id, "succeeded", 30*time.Second)
 	if env.rec.count(jobID) != 1 {
 		t.Fatalf("sender calls = %d", env.rec.count(jobID))
 	}
@@ -644,15 +652,23 @@ func mustTime(t *testing.T, v any) time.Time {
 
 type faultStore struct {
 	*postgres.Store
-	failMark   atomic.Bool
-	failFinish atomic.Bool
+	failMark         atomic.Bool
+	failFinish       atomic.Bool
+	loseMarkResponse atomic.Bool
 }
 
-func (s *faultStore) MarkSendStarted(ctx context.Context, id uuid.UUID) (time.Time, error) {
+func (s *faultStore) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error) {
 	if s.failMark.Load() {
 		return time.Time{}, dbDown()
 	}
-	return s.Store.MarkSendStarted(ctx, id)
+	started, err := s.Store.MarkSendStarted(ctx, id, attempt)
+	if err != nil {
+		return started, err
+	}
+	if s.loseMarkResponse.CompareAndSwap(true, false) {
+		return started, dbDown()
+	}
+	return started, nil
 }
 
 func (s *faultStore) Finish(ctx context.Context, id uuid.UUID, status domain.Status, lastError *string) error {

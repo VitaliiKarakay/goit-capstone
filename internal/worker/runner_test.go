@@ -103,32 +103,39 @@ func TestHandleContinuesProcessingBeforeSendOnAnotherWorker(t *testing.T) {
 	}
 }
 
-func TestHandleRetriesFinishWithoutAnotherSend(t *testing.T) {
+func TestHandleRetriesFinishWithoutRedelivery(t *testing.T) {
 	job := sampleJob()
-	started := time.Now().UTC()
-	store := &fakeStore{found: true, claimed: true, job: job, finishErr: dialErr()}
+	store := &fakeStore{found: true, claimed: true, job: job, finishFails: 2}
 	send := &fakeSender{err: errors.New("mock rejected")}
 	msg := &fakeMsg{data: []byte(job.ID.String())}
 	runner := testRunner(store, send)
 	runner.retryDelays = nil
+	runner.nakDelay = time.Millisecond
 
 	runner.handle(context.Background(), msg.data, msg)
-	if send.calls != 1 || !store.marked || store.finished != "" || len(msg.naks) != 1 {
-		t.Fatalf("calls=%d marked=%v finish=%s naks=%v", send.calls, store.marked, store.finished, msg.naks)
+	if send.calls != 1 || !store.marked || store.finished != domain.StatusFailed || store.last == nil || *store.last != "mock rejected" {
+		t.Fatalf("calls=%d marked=%v finish=%s last=%v", send.calls, store.marked, store.finished, store.last)
 	}
-
-	store.claimed = false
-	store.finishErr = nil
-	store.job.Status = domain.StatusProcessing
-	store.job.SendStartedAt = &started
-	again := &fakeMsg{data: msg.data}
-	runner.handle(context.Background(), again.data, again)
-	if send.calls != 1 || store.finished != domain.StatusFailed || store.last == nil || *store.last != "mock rejected" || again.acks != 1 {
-		t.Fatalf("calls=%d finish=%s last=%v acks=%d", send.calls, store.finished, store.last, again.acks)
+	if msg.acks != 1 || len(msg.naks) != 0 {
+		t.Fatalf("acks=%d naks=%v", msg.acks, msg.naks)
 	}
 }
 
-func TestHandleDelaysProcessingWhenSendResultIsElsewhere(t *testing.T) {
+func TestHandleMarkSendStartedSurvivesLostResponse(t *testing.T) {
+	job := sampleJob()
+	store := &fakeStore{found: true, claimed: true, job: job, spuriousMarkErr: true}
+	send := &fakeSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.retryDelays = []time.Duration{0}
+
+	runner.handle(context.Background(), msg.data, msg)
+	if send.calls != 1 || !store.marked || store.finished != domain.StatusSucceeded || msg.acks != 1 {
+		t.Fatalf("calls=%d marked=%v finish=%s acks=%d", send.calls, store.marked, store.finished, msg.acks)
+	}
+}
+
+func TestHandleDelaysProcessingWhenSendAlreadyStarted(t *testing.T) {
 	job := sampleJob()
 	started := time.Now().UTC()
 	job.Status = domain.StatusProcessing
@@ -175,7 +182,14 @@ func testRunner(store Store, send sender.Sender) *Runner {
 }
 
 func sampleJob() domain.Job {
-	return domain.Job{ID: uuid.New(), RecipientID: "user-1", Status: domain.StatusQueued, Payload: []byte(`{"to":"a","subject":"s","body":"b"}`)}
+	attempt := uuid.New()
+	return domain.Job{
+		ID:            uuid.New(),
+		RecipientID:   "user-1",
+		Status:        domain.StatusQueued,
+		Payload:       []byte(`{"to":"a","subject":"s","body":"b"}`),
+		SendAttemptID: &attempt,
+	}
 }
 
 func dialErr() error {
@@ -183,15 +197,17 @@ func dialErr() error {
 }
 
 type fakeStore struct {
-	claimErr  error
-	markErr   error
-	finishErr error
-	job       domain.Job
-	found     bool
-	claimed   bool
-	marked    bool
-	finished  domain.Status
-	last      *string
+	claimErr        error
+	markErr         error
+	spuriousMarkErr bool
+	finishFails     int
+	finishCalls     int
+	job             domain.Job
+	found           bool
+	claimed         bool
+	marked          bool
+	finished        domain.Status
+	last            *string
 }
 
 func (f *fakeStore) Claim(context.Context, uuid.UUID, string) (domain.Job, bool, bool, error) {
@@ -201,17 +217,28 @@ func (f *fakeStore) Claim(context.Context, uuid.UUID, string) (domain.Job, bool,
 	return f.job, f.found, f.claimed, nil
 }
 
-func (f *fakeStore) MarkSendStarted(context.Context, uuid.UUID) (time.Time, error) {
+func (f *fakeStore) MarkSendStarted(_ context.Context, id, attempt uuid.UUID) (time.Time, error) {
+	if f.job.SendAttemptID == nil || attempt != *f.job.SendAttemptID {
+		return time.Time{}, domain.ErrNotProcessing
+	}
 	if f.markErr != nil {
 		return time.Time{}, f.markErr
 	}
+	if f.marked {
+		return time.Now().UTC(), nil
+	}
 	f.marked = true
+	if f.spuriousMarkErr {
+		f.spuriousMarkErr = false
+		return time.Now().UTC(), dialErr()
+	}
 	return time.Now().UTC(), nil
 }
 
 func (f *fakeStore) Finish(_ context.Context, _ uuid.UUID, status domain.Status, lastError *string) error {
-	if f.finishErr != nil {
-		return f.finishErr
+	f.finishCalls++
+	if f.finishFails > 0 && f.finishCalls <= f.finishFails {
+		return dialErr()
 	}
 	f.finished = status
 	f.last = lastError

@@ -48,6 +48,7 @@ type Job struct {
 	WorkerID       *string
 	LastError      *string
 	SendStartedAt  *time.Time
+	SendAttemptID  *uuid.UUID
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	FinishedAt     *time.Time
