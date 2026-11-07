@@ -1,6 +1,9 @@
 package domain
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRenderTemplateEscapes(t *testing.T) {
 	sub, body, errs := RenderTemplate("template.subject", "template.body",
@@ -43,6 +46,15 @@ func TestRenderEmptyVariableAllowed(t *testing.T) {
 func TestScanTemplateInvalidBracket(t *testing.T) {
 	if errs := ScanTemplateSyntax("template.subject", "template.body", "a]b", ""); len(errs) == 0 {
 		t.Fatal("expected invalid")
+	}
+}
+
+func TestRenderStopsBeforeOversizedSubstitution(t *testing.T) {
+	huge := strings.Repeat("x", MaxPayloadBytes+1)
+	_, _, errs := RenderTemplate("recipients[0].template.body", "recipients[0].template.body",
+		"[v]", "", map[string]string{"v": huge})
+	if len(errs) != 1 || errs[0].Code != "too_large" {
+		t.Fatalf("errs=%v", errs)
 	}
 }
 

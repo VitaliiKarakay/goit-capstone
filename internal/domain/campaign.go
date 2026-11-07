@@ -145,8 +145,17 @@ func ParseCampaign(body []byte, now time.Time) (NewCampaign, error) {
 					details = append(details, FieldError{Field: prefix + ".variables." + k, Code: "invalid"})
 					continue
 				}
+				trimmed := bytes.TrimSpace(raw)
+				if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+					details = append(details, FieldError{Field: prefix + ".variables." + k, Code: "invalid"})
+					continue
+				}
+				if trimmed[0] != '"' {
+					details = append(details, FieldError{Field: prefix + ".variables." + k, Code: "invalid"})
+					continue
+				}
 				var text string
-				if err := json.Unmarshal(raw, &text); err != nil {
+				if err := json.Unmarshal(trimmed, &text); err != nil {
 					details = append(details, FieldError{Field: prefix + ".variables." + k, Code: "invalid"})
 					continue
 				}

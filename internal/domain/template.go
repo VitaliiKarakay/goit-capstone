@@ -57,7 +57,17 @@ func scanSyntax(field, text string) []FieldError {
 func renderField(field, text string, variables map[string]string) (string, []FieldError) {
 	var out strings.Builder
 	var details []FieldError
+	limit := MaxPayloadBytes
+	appendBytes := func(b []byte) bool {
+		if out.Len()+len(b) > limit {
+			details = append(details, FieldError{Field: field, Code: "too_large"})
+			return false
+		}
+		out.Write(b)
+		return true
+	}
 	i := 0
+loop:
 	for i < len(text) {
 		if text[i] == '\\' {
 			if i+1 >= len(text) {
@@ -66,7 +76,9 @@ func renderField(field, text string, variables map[string]string) (string, []Fie
 			}
 			switch text[i+1] {
 			case '[', ']', '\\':
-				out.WriteByte(text[i+1])
+				if !appendBytes([]byte{text[i+1]}) {
+					break loop
+				}
 				i += 2
 			default:
 				details = append(details, FieldError{Field: field, Code: "invalid_escape"})
@@ -87,13 +99,17 @@ func renderField(field, text string, variables map[string]string) (string, []Fie
 			value, found := variables[name]
 			if !found {
 				details = append(details, FieldError{Field: field + ".variables." + name, Code: "missing_variable"})
-			} else {
-				out.WriteString(value)
+			} else if !appendBytes([]byte(value)) {
+				break loop
 			}
 			i = next
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(text[i:])
+		if out.Len()+size > limit {
+			details = append(details, FieldError{Field: field, Code: "too_large"})
+			break
+		}
 		out.WriteRune(r)
 		i += size
 	}

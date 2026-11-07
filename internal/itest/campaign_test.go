@@ -58,8 +58,25 @@ func TestCampaignValidationLeavesNoRows(t *testing.T) {
 	key := "camp-bad-" + uuid.NewString()
 	at := time.Now().Add(time.Hour).UTC()
 	body := campaignBody(key, at, []recipientSpec{
-		{"user-a", "a@example.com", map[string]string{"name": "A"}},
-		{"user-a", "b@example.com", map[string]string{"name": "B"}},
+		{"user-a", "a@example.com", campaignVars("A", "1", "UAH")},
+		{"user-a", "b@example.com", campaignVars("B", "2", "UAH")},
+	})
+	code, _, err := env.postCampaign(body)
+	if err == nil && code != http.StatusBadRequest {
+		t.Fatalf("status=%d", code)
+	}
+	afterCamp, afterJobs := tableCounts(t)
+	if afterCamp != beforeCamp || afterJobs != beforeJobs {
+		t.Fatalf("counts changed camp %d->%d jobs %d->%d", beforeCamp, afterCamp, beforeJobs, afterJobs)
+	}
+}
+
+func TestCampaignValidationMissingVariables(t *testing.T) {
+	beforeCamp, beforeJobs := tableCounts(t)
+	key := "camp-miss-" + uuid.NewString()
+	at := time.Now().Add(time.Hour).UTC()
+	body := campaignBody(key, at, []recipientSpec{
+		{"user-a", "a@example.com", map[string]string{"name": "Only"}},
 	})
 	code, _, err := env.postCampaign(body)
 	if err == nil && code != http.StatusBadRequest {
@@ -101,8 +118,8 @@ func TestCampaignCreateRollbackOnJobInsertFailure(t *testing.T) {
 	key := "camp-roll-" + uuid.NewString()
 	at := time.Now().Add(time.Hour).UTC()
 	body := campaignBody(key, at, []recipientSpec{
-		{"ok-user", "ok@example.com", map[string]string{"name": "OK"}},
-		{"trigger-fail", "x@example.com", map[string]string{"name": "Fail"}},
+		{"ok-user", "ok@example.com", campaignVars("OK", "1", "UAH")},
+		{"trigger-fail", "x@example.com", campaignVars("Fail", "2", "UAH")},
 	})
 	code, _, err := env.postCampaign(body)
 	if err == nil && code < 500 {
@@ -128,8 +145,8 @@ func TestCampaignConcurrentIdempotency(t *testing.T) {
 	key := "camp-idem-" + uuid.NewString()
 	at := time.Now().Add(time.Hour).UTC()
 	body := campaignBody(key, at, []recipientSpec{
-		{"user-1", "1@example.com", map[string]string{"name": "One"}},
-		{"user-2", "2@example.com", map[string]string{"name": "Two"}},
+		{"user-1", "1@example.com", campaignVars("One", "10", "UAH")},
+		{"user-2", "2@example.com", campaignVars("Two", "20", "UAH")},
 	})
 	const n = 12
 	var wg sync.WaitGroup
@@ -176,8 +193,8 @@ func TestCampaignIdempotencyPermutationAndConflict(t *testing.T) {
 	key := "camp-hash-" + uuid.NewString()
 	at := time.Now().Add(time.Hour).UTC()
 	r1 := []recipientSpec{
-		{"user-b", "b@x.com", map[string]string{"name": "B"}},
-		{"user-a", "a@x.com", map[string]string{"name": "A"}},
+		{"user-b", "b@x.com", campaignVars("B", "1", "UAH")},
+		{"user-a", "a@x.com", campaignVars("A", "2", "UAH")},
 	}
 	code, resp, err := env.postCampaign(campaignBody(key, at, r1))
 	if err != nil || code != http.StatusCreated {
@@ -185,8 +202,8 @@ func TestCampaignIdempotencyPermutationAndConflict(t *testing.T) {
 	}
 	id := resp["campaign_id"].(string)
 	r2 := []recipientSpec{
-		{"user-a", "a@x.com", map[string]string{"name": "A"}},
-		{"user-b", "b@x.com", map[string]string{"name": "B"}},
+		{"user-a", "a@x.com", campaignVars("A", "2", "UAH")},
+		{"user-b", "b@x.com", campaignVars("B", "1", "UAH")},
 	}
 	code, resp2, err := env.postCampaign(campaignBody(key, at, r2))
 	if err != nil || code != http.StatusOK || resp2["campaign_id"].(string) != id {
@@ -207,9 +224,9 @@ func TestCampaignTargetedCancel(t *testing.T) {
 	key := "camp-cancel-" + uuid.NewString()
 	at := time.Now().Add(-time.Second).UTC()
 	body := campaignBody(key, at, []recipientSpec{
-		{"user-1", "1@x.com", map[string]string{"name": "One"}},
-		{"user-2", "2@x.com", map[string]string{"name": "Two"}},
-		{"user-3", "3@x.com", map[string]string{"name": "Three"}},
+		{"user-1", "1@x.com", campaignVars("One", "1", "UAH")},
+		{"user-2", "2@x.com", campaignVars("Two", "2", "UAH")},
+		{"user-3", "3@x.com", campaignVars("Three", "3", "UAH")},
 	})
 	code, resp, err := env.postCampaign(body)
 	if err != nil || code != http.StatusCreated {
@@ -227,8 +244,8 @@ func TestCampaignTargetedCancel(t *testing.T) {
 		t.Fatalf("results=%v", cancelResp)
 	}
 	env.fault.pauseClaim.Store(false)
-	env.waitCampaignSummary(t, campaignID, 2, 1, 60*time.Second)
-	if env.rec.countByCampaign(t, campaignID) != 2 {
+	env.waitCampaignSummary(t, campaignID, 1, 2, 60*time.Second)
+	if env.rec.countByCampaign(t, campaignID) != 1 {
 		t.Fatalf("sender calls=%d", env.rec.countByCampaign(t, campaignID))
 	}
 }
@@ -237,7 +254,7 @@ func TestCampaignCancelMixedAndReplay(t *testing.T) {
 	key := "camp-mix-" + uuid.NewString()
 	at := time.Now().Add(time.Hour).UTC()
 	body := campaignBody(key, at, []recipientSpec{
-		{"user-1", "1@x.com", map[string]string{"name": "One"}},
+		{"user-1", "1@x.com", campaignVars("One", "1", "UAH")},
 	})
 	code, resp, err := env.postCampaign(body)
 	if err != nil || code != http.StatusCreated {
@@ -269,8 +286,8 @@ func TestCampaignSummaryMatchesJobs(t *testing.T) {
 	key := "camp-sum-" + uuid.NewString()
 	at := time.Now().Add(time.Hour).UTC()
 	body := campaignBody(key, at, []recipientSpec{
-		{"u1", "1@x.com", map[string]string{"name": "1"}},
-		{"u2", "2@x.com", map[string]string{"name": "2"}},
+		{"u1", "1@x.com", campaignVars("1", "10", "UAH")},
+		{"u2", "2@x.com", campaignVars("2", "20", "UAH")},
 	})
 	_, resp, _ := env.postCampaign(body)
 	id := resp["campaign_id"].(string)
@@ -294,7 +311,7 @@ func TestStandaloneIdempotencyKeySpaceSeparate(t *testing.T) {
 	}
 	campKey := "camp-space-" + uuid.NewString()
 	camp := campaignBody(campKey, at, []recipientSpec{
-		{"user-c", "c@x.com", map[string]string{"name": "C"}},
+		{"user-c", "c@x.com", campaignVars("C", "1", "UAH")},
 	})
 	if _, _, err := env.postCampaign(camp); err != nil {
 		t.Fatal(err)
@@ -317,6 +334,10 @@ type recipientSpec struct {
 	id        string
 	to        string
 	variables map[string]string
+}
+
+func campaignVars(name, sum, currency string) map[string]string {
+	return map[string]string{"name": name, "sum": sum, "currency": currency}
 }
 
 func campaignBody(key string, at time.Time, recipients []recipientSpec) string {
