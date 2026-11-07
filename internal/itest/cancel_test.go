@@ -183,11 +183,17 @@ func TestCanceledJobRedeliveryDoesNotSend(t *testing.T) {
 	assertCancelAPI(t, code, resp, id, jobID)
 
 	env.fault.pauseClaim.Store(false)
-	_, err = env.js.Publish(natspub.Subject, []byte(id), nats.MsgId("cancel-redel-"+id))
-	if err != nil {
+	beforeAcks := env.canceledTerminalAcks()
+	if _, err = env.js.Publish(natspub.Subject, []byte(id), nats.MsgId("cancel-redel-"+id)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
+	for env.canceledTerminalAcks() <= beforeAcks && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if env.canceledTerminalAcks() <= beforeAcks {
+		t.Fatal("worker did not ack canceled terminal delivery")
+	}
 	if env.rec.count(jobID) != 0 {
 		t.Fatalf("sender calls after redelivery = %d", env.rec.count(jobID))
 	}
@@ -220,7 +226,7 @@ func TestCreateAfterCancelReturnsSameJob(t *testing.T) {
 		t.Fatalf("status = %v", job["status"])
 	}
 	var rows int
-	if err := env.db.QueryRow(context.Background(), `SELECT count(*) FROM jobs WHERE idempotency_key = $1`, key).Scan(&rows); err != nil {
+	if err := env.db.QueryRow(context.Background(), `SELECT count(*) FROM jobs WHERE idempotency_key = $1 AND campaign_id IS NULL`, key).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
 	if rows != 1 {

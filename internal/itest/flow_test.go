@@ -88,7 +88,7 @@ func TestConcurrentIdempotency(t *testing.T) {
 		t.Fatalf("created responses = %d", created)
 	}
 	var rows int
-	if err := env.db.QueryRow(context.Background(), `SELECT count(*) FROM jobs WHERE idempotency_key = $1`, keyFrom(t, body)).Scan(&rows); err != nil {
+	if err := env.db.QueryRow(context.Background(), `SELECT count(*) FROM jobs WHERE idempotency_key = $1 AND campaign_id IS NULL`, keyFrom(t, body)).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
 	if rows != 1 {
@@ -733,6 +733,14 @@ func (e *environment) consumerRedelivered() int {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return -1
+}
+
+func (e *environment) canceledTerminalAcks() int64 {
+	var n int64
+	for _, runner := range e.runners {
+		n += runner.Stats.CanceledTerminalAcks.Load()
+	}
+	return n
 }
 
 func (e *environment) consumerSeq(t *testing.T) uint64 {

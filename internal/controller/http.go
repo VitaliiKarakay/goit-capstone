@@ -16,7 +16,10 @@ import (
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 )
 
-const MaxBodyBytes = 64 * 1024
+const (
+	MaxBodyBytes         = 64 * 1024
+	MaxCampaignBodyBytes = domain.MaxCampaignBodyBytes
+)
 
 type JobRepository interface {
 	CreateJob(ctx context.Context, job domain.NewJob) (domain.Job, bool, error)
@@ -24,13 +27,25 @@ type JobRepository interface {
 	CancelJob(ctx context.Context, id uuid.UUID) (domain.Job, domain.CancelOutcome, error)
 }
 
+type CampaignRepository interface {
+	CreateCampaign(ctx context.Context, in domain.NewCampaign) (domain.CampaignSummary, bool, error)
+	GetCampaign(ctx context.Context, id uuid.UUID) (domain.CampaignSummary, error)
+	CancelCampaignRecipients(ctx context.Context, id uuid.UUID, recipientIDs []string) ([]domain.RecipientCancelOutcome, error)
+}
+
+type Repository interface {
+	JobRepository
+	CampaignRepository
+}
+
 type API struct {
 	log  *slog.Logger
 	jobs JobRepository
+	camp CampaignRepository
 }
 
-func NewAPI(log *slog.Logger, jobs JobRepository) *API {
-	return &API{log: log, jobs: jobs}
+func NewAPI(log *slog.Logger, repo Repository) *API {
+	return &API{log: log, jobs: repo, camp: repo}
 }
 
 func (a *API) Handler() http.Handler {
@@ -38,6 +53,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /jobs", a.createJob)
 	mux.HandleFunc("POST /jobs/{id}/cancel", a.cancelJob)
 	mux.HandleFunc("GET /jobs/{id}", a.getJob)
+	mux.HandleFunc("POST /campaigns", a.createCampaign)
+	mux.HandleFunc("GET /campaigns/{id}", a.getCampaign)
+	mux.HandleFunc("POST /campaigns/{id}/cancel", a.cancelCampaign)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -47,8 +65,8 @@ func (a *API) Handler() http.Handler {
 func (a *API) createJob(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		var max *http.MaxBytesError
-		if errors.As(err, &max) {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
 			writeRequestTooLarge(w)
 			return
 		}
@@ -100,8 +118,8 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		var max *http.MaxBytesError
-		if errors.As(err, &max) {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
 			writeRequestTooLarge(w)
 			return
 		}
@@ -139,10 +157,18 @@ func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func readBody(r *http.Request) ([]byte, error) {
-	r.Body = http.MaxBytesReader(nil, r.Body, MaxBodyBytes)
+	return readBodyLimit(r, MaxBodyBytes)
+}
+
+func readBodyLimit(r *http.Request, limit int64) ([]byte, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, limit)
 	body, err := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	return body, err
+}
+
+func writeCampaignTooLarge(w http.ResponseWriter) {
+	writeError(w, http.StatusBadRequest, "request_too_large", "request body exceeds "+strconv.Itoa(MaxCampaignBodyBytes)+" bytes", nil)
 }
 
 func writeParseError(w http.ResponseWriter, err error) {
@@ -172,9 +198,101 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 	writeJSON(w, status, errorResponse{Error: errorObject{Code: code, Message: message, Details: details}})
 }
 
+func (a *API) createCampaign(w http.ResponseWriter, r *http.Request) {
+	body, err := readBodyLimit(r, MaxCampaignBodyBytes)
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeCampaignTooLarge(w)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", "could not read request body", nil)
+		return
+	}
+	in, err := domain.ParseCampaign(body, time.Now())
+	if err != nil {
+		writeParseError(w, err)
+		return
+	}
+	summary, inserted, err := a.camp.CreateCampaign(r.Context(), in)
+	if errors.Is(err, domain.ErrConflict) {
+		writeError(w, http.StatusConflict, "idempotency_conflict", "idempotency key already exists with different content", nil)
+		return
+	}
+	if err != nil {
+		a.log.Error("create campaign", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal error", nil)
+		return
+	}
+	status := http.StatusOK
+	if inserted {
+		status = http.StatusCreated
+	}
+	w.Header().Set("Location", "/campaigns/"+summary.ID.String())
+	writeJSON(w, status, campaignView(summary))
+}
+
+func (a *API) getCampaign(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "campaign not found", nil)
+		return
+	}
+	summary, err := a.camp.GetCampaign(r.Context(), id)
+	if errors.Is(err, domain.ErrCampaignNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "campaign not found", nil)
+		return
+	}
+	if err != nil {
+		a.log.Error("get campaign", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal error", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, campaignView(summary))
+}
+
+func (a *API) cancelCampaign(w http.ResponseWriter, r *http.Request) {
+	body, err := readBodyLimit(r, MaxBodyBytes)
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeError(w, http.StatusBadRequest, "request_too_large", "request body exceeds "+strconv.Itoa(MaxBodyBytes)+" bytes", nil)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", "could not read request body", nil)
+		return
+	}
+	recipientIDs, err := domain.ParseCampaignCancel(body)
+	if err != nil {
+		writeParseError(w, err)
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "campaign not found", nil)
+		return
+	}
+	outcomes, err := a.camp.CancelCampaignRecipients(r.Context(), id, recipientIDs)
+	if errors.Is(err, domain.ErrCampaignNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "campaign not found", nil)
+		return
+	}
+	if err != nil {
+		a.log.Error("cancel campaign", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal error", nil)
+		return
+	}
+	results := make([]campaignCancelResult, len(outcomes))
+	for i, o := range outcomes {
+		results[i] = campaignCancelResult{RecipientID: o.RecipientID, Result: o.Result}
+	}
+	writeJSON(w, http.StatusOK, campaignCancelResponse{CampaignID: id.String(), Results: results})
+}
+
 type jobResponse struct {
 	ID             string          `json:"id"`
 	IdempotencyKey string          `json:"idempotency_key"`
+	CampaignID     *string         `json:"campaign_id,omitempty"`
 	RecipientID    string          `json:"recipient_id"`
 	ScheduledAt    string          `json:"scheduled_at"`
 	Sender         string          `json:"sender"`
@@ -195,10 +313,52 @@ type cancelResponse struct {
 	Result string `json:"result"`
 }
 
+type campaignResponse struct {
+	CampaignID  string         `json:"campaign_id"`
+	ScheduledAt string         `json:"scheduled_at"`
+	Sender      string         `json:"sender"`
+	TotalJobs   int            `json:"total_jobs"`
+	Counts      map[string]int `json:"counts"`
+}
+
+type campaignCancelResponse struct {
+	CampaignID string                 `json:"campaign_id"`
+	Results    []campaignCancelResult `json:"results"`
+}
+
+type campaignCancelResult struct {
+	RecipientID string `json:"recipient_id"`
+	Result      string `json:"result"`
+}
+
+func campaignView(c domain.CampaignSummary) campaignResponse {
+	counts := map[string]int{
+		string(domain.StatusScheduled):  c.Counts[domain.StatusScheduled],
+		string(domain.StatusQueued):     c.Counts[domain.StatusQueued],
+		string(domain.StatusProcessing): c.Counts[domain.StatusProcessing],
+		string(domain.StatusSucceeded):  c.Counts[domain.StatusSucceeded],
+		string(domain.StatusFailed):     c.Counts[domain.StatusFailed],
+		string(domain.StatusCanceled):   c.Counts[domain.StatusCanceled],
+	}
+	return campaignResponse{
+		CampaignID:  c.ID.String(),
+		ScheduledAt: domain.FormatTime(c.ScheduledAt),
+		Sender:      c.Sender,
+		TotalJobs:   c.TotalJobs,
+		Counts:      counts,
+	}
+}
+
 func jobView(job domain.Job) jobResponse {
+	var campaignID *string
+	if job.CampaignID != nil {
+		value := job.CampaignID.String()
+		campaignID = &value
+	}
 	return jobResponse{
 		ID:             job.ID.String(),
 		IdempotencyKey: job.IdempotencyKey,
+		CampaignID:     campaignID,
 		RecipientID:    job.RecipientID,
 		ScheduledAt:    domain.FormatTime(job.ScheduledAt),
 		Sender:         job.Sender,

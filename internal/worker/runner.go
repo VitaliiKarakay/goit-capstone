@@ -22,8 +22,9 @@ type Store interface {
 }
 
 type Stats struct {
-	DelayedNak      atomic.Int64
-	NotOwnerRejects atomic.Int64
+	DelayedNak           atomic.Int64
+	NotOwnerRejects      atomic.Int64
+	CanceledTerminalAcks atomic.Int64
 }
 
 type Runner struct {
@@ -137,6 +138,9 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
 	switch job.Status {
 	case domain.StatusSucceeded, domain.StatusFailed, domain.StatusCanceled:
+		if job.Status == domain.StatusCanceled {
+			r.Stats.CanceledTerminalAcks.Add(1)
+		}
 		r.log.Info("skip terminal duplicate", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
 		_ = msg.Ack()
 	case domain.StatusProcessing:

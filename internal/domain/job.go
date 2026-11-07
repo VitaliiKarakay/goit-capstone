@@ -49,6 +49,7 @@ func FormatTime(t time.Time) string {
 type Job struct {
 	ID             uuid.UUID
 	IdempotencyKey string
+	CampaignID     *uuid.UUID
 	RecipientID    string
 	ScheduledAt    time.Time
 	Sender         string

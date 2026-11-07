@@ -182,8 +182,46 @@ func validBody(at time.Time) string {
 }
 
 type memStore struct {
-	saved domain.Job
-	hash  []byte
+	saved    domain.Job
+	hash     []byte
+	campaign domain.CampaignSummary
+	campHash []byte
+}
+
+func (m *memStore) CreateCampaign(_ context.Context, in domain.NewCampaign) (domain.CampaignSummary, bool, error) {
+	if m.campaign.ID != uuid.Nil {
+		if !bytes.Equal(m.campHash, in.ContentHash) {
+			return domain.CampaignSummary{}, false, domain.ErrConflict
+		}
+		return m.campaign, false, nil
+	}
+	m.campHash = append([]byte(nil), in.ContentHash...)
+	m.campaign = domain.CampaignSummary{
+		ID:          uuid.New(),
+		ScheduledAt: in.ScheduledAt,
+		Sender:      in.Sender,
+		TotalJobs:   len(in.Recipients),
+		Counts:      map[domain.Status]int{domain.StatusScheduled: len(in.Recipients)},
+	}
+	return m.campaign, true, nil
+}
+
+func (m *memStore) GetCampaign(_ context.Context, id uuid.UUID) (domain.CampaignSummary, error) {
+	if m.campaign.ID != id {
+		return domain.CampaignSummary{}, domain.ErrCampaignNotFound
+	}
+	return m.campaign, nil
+}
+
+func (m *memStore) CancelCampaignRecipients(_ context.Context, id uuid.UUID, ids []string) ([]domain.RecipientCancelOutcome, error) {
+	if m.campaign.ID != id {
+		return nil, domain.ErrCampaignNotFound
+	}
+	out := make([]domain.RecipientCancelOutcome, len(ids))
+	for i, rid := range ids {
+		out[i] = domain.RecipientCancelOutcome{RecipientID: rid, Result: domain.CampaignCancelResultNotFound}
+	}
+	return out, nil
 }
 
 func (m *memStore) CreateJob(_ context.Context, in domain.NewJob) (domain.Job, bool, error) {

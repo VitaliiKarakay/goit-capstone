@@ -12,7 +12,7 @@ import (
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 )
 
-const jobColumns = `id::text, idempotency_key, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, send_attempt_id::text, canceled_at, created_at, updated_at, finished_at`
+const jobColumns = `id::text, idempotency_key, campaign_id::text, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, send_attempt_id::text, canceled_at, created_at, updated_at, finished_at`
 
 type OutboxMessage struct {
 	ID    int64
@@ -21,9 +21,9 @@ type OutboxMessage struct {
 
 func (s *Store) CreateJob(ctx context.Context, in domain.NewJob) (domain.Job, bool, error) {
 	job, err := scanJob(s.pool.QueryRow(ctx, `
-		INSERT INTO jobs (idempotency_key, content_hash, recipient_id, scheduled_at, sender, payload, status)
-		VALUES ($1, $2, $3, $4, $5, $6::json, 'scheduled')
-		ON CONFLICT (idempotency_key) DO NOTHING
+		INSERT INTO jobs (idempotency_key, content_hash, recipient_id, scheduled_at, sender, payload, status, campaign_id)
+		VALUES ($1, $2, $3, $4, $5, $6::json, 'scheduled', NULL)
+		ON CONFLICT (idempotency_key) WHERE campaign_id IS NULL DO NOTHING
 		RETURNING `+jobColumns,
 		in.IdempotencyKey, in.ContentHash, in.RecipientID, in.ScheduledAt, in.Sender, string(in.Payload),
 	))
@@ -54,7 +54,24 @@ func (s *Store) GetJob(ctx context.Context, id uuid.UUID) (domain.Job, error) {
 
 // CancelJob transitions scheduled or queued jobs to canceled. It races with Claim on queued rows.
 func (s *Store) CancelJob(ctx context.Context, id uuid.UUID) (domain.Job, domain.CancelOutcome, error) {
-	job, err := scanJob(s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Job{}, "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	job, outcome, err := cancelJobTx(ctx, tx, id)
+	if err != nil {
+		return domain.Job{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Job{}, "", err
+	}
+	return job, outcome, nil
+}
+
+func cancelJobTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (domain.Job, domain.CancelOutcome, error) {
+	job, err := scanJob(tx.QueryRow(ctx, `
 		UPDATE jobs
 		SET status = 'canceled', canceled_at = now(), updated_at = now()
 		WHERE id = $1::uuid AND status IN ('scheduled', 'queued')
@@ -65,8 +82,8 @@ func (s *Store) CancelJob(ctx context.Context, id uuid.UUID) (domain.Job, domain
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return domain.Job{}, "", err
 	}
-	job, err = s.GetJob(ctx, id)
-	if errors.Is(err, domain.ErrNotFound) {
+	job, err = scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id = $1::uuid`, id.String()))
+	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Job{}, "", domain.ErrNotFound
 	}
 	if err != nil {
@@ -78,7 +95,7 @@ func (s *Store) CancelJob(ctx context.Context, id uuid.UUID) (domain.Job, domain
 	case domain.StatusProcessing, domain.StatusSucceeded, domain.StatusFailed:
 		return domain.Job{}, "", domain.ErrTooLate
 	case domain.StatusScheduled, domain.StatusQueued:
-		job, err = scanJob(s.pool.QueryRow(ctx, `
+		job, err = scanJob(tx.QueryRow(ctx, `
 			UPDATE jobs
 			SET status = 'canceled', canceled_at = now(), updated_at = now()
 			WHERE id = $1::uuid AND status IN ('scheduled', 'queued')
@@ -252,13 +269,14 @@ func (s *Store) Finish(ctx context.Context, id uuid.UUID, status domain.Status, 
 }
 
 func (s *Store) jobByKey(ctx context.Context, key string) (domain.Job, []byte, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+jobColumns+`, content_hash FROM jobs WHERE idempotency_key = $1`, key)
+	row := s.pool.QueryRow(ctx, `SELECT `+jobColumns+`, content_hash FROM jobs WHERE idempotency_key = $1 AND campaign_id IS NULL`, key)
 	var job domain.Job
 	var id, payload, status string
 	var attempt *string
 	var hash []byte
+	var campaignID *string
 	err := row.Scan(
-		&id, &job.IdempotencyKey, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
+		&id, &job.IdempotencyKey, &campaignID, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
 		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CanceledAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &hash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -274,6 +292,9 @@ func (s *Store) jobByKey(ctx context.Context, key string) (domain.Job, []byte, e
 	job.ID = parsed
 	job.Payload = []byte(payload)
 	job.Status = domain.Status(status)
+	if err := applyCampaignID(campaignID, &job); err != nil {
+		return domain.Job{}, nil, err
+	}
 	if err := scanAttempt(attempt, &job); err != nil {
 		return domain.Job{}, nil, err
 	}
@@ -283,9 +304,10 @@ func (s *Store) jobByKey(ctx context.Context, key string) (domain.Job, []byte, e
 func scanJob(row pgx.Row) (domain.Job, error) {
 	var job domain.Job
 	var id, payload, status string
+	var campaignID *string
 	var attempt *string
 	err := row.Scan(
-		&id, &job.IdempotencyKey, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
+		&id, &job.IdempotencyKey, &campaignID, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
 		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CanceledAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt,
 	)
 	if err != nil {
@@ -298,10 +320,25 @@ func scanJob(row pgx.Row) (domain.Job, error) {
 	job.ID = parsed
 	job.Payload = []byte(payload)
 	job.Status = domain.Status(status)
+	if err := applyCampaignID(campaignID, &job); err != nil {
+		return domain.Job{}, err
+	}
 	if err := scanAttempt(attempt, &job); err != nil {
 		return domain.Job{}, err
 	}
 	return job, nil
+}
+
+func applyCampaignID(raw *string, job *domain.Job) error {
+	if raw == nil || *raw == "" {
+		return nil
+	}
+	parsed, err := uuid.Parse(*raw)
+	if err != nil {
+		return err
+	}
+	job.CampaignID = &parsed
+	return nil
 }
 
 func scanAttempt(raw *string, job *domain.Job) error {

@@ -2,7 +2,9 @@
 
 This repository implements a single-job scheduling pipeline: HTTP API, PostgreSQL, NATS JetStream, and workers that call a mock sender (no real email or SMS).
 
-**Iteration 2** adds canceling a single job via `POST /jobs/{id}/cancel`. Campaigns, templates, and recovery of stuck `processing` jobs are still out of scope.
+**Iteration 2** adds canceling a single job via `POST /jobs/{id}/cancel`.
+
+**Iteration 3** adds campaigns with template variables and per-recipient cancel via `POST /campaigns/{id}/cancel`. Recovery of stuck `processing` jobs is still out of scope.
 
 ## Requirements
 
@@ -26,6 +28,7 @@ Published on `127.0.0.1` only. API port defaults to `8080`:
 API_PORT=18080 docker compose up --build
 API=http://127.0.0.1:18080 python3 scripts/demo.py
 API=http://127.0.0.1:18080 python3 scripts/demo_cancel.py
+API=http://127.0.0.1:18080 python3 scripts/demo_campaign.py
 ```
 
 The `migrate` service applies SQL migrations once. Two worker replicas share one durable NATS consumer.
@@ -48,11 +51,31 @@ go run ./cmd/worker
 ### Create and read jobs
 
 - `POST /jobs` — create a job (`201` + `Location`, or `200` idempotent replay)
-- `GET /jobs/{id}` — full job view including `canceled_at` when applicable
+- `GET /jobs/{id}` — full job view including `canceled_at` and `campaign_id` when set
 
-Request body limit: 64 KiB before JSON decode. Payload object limit: 16 KiB. `scheduled_at` must be RFC3339 with timezone; stored in UTC with microsecond truncation.
+Request body limit: **64 KiB** before JSON decode. Payload object limit: **16 KiB**. `scheduled_at` must be RFC3339 with timezone; stored in UTC with microsecond truncation.
+
+Standalone idempotency uses `jobs.idempotency_key` with `campaign_id IS NULL` (separate namespace from campaign jobs).
 
 Idempotency: same `idempotency_key` and canonical content returns the same job (including `canceled`). Different content → `409 idempotency_conflict`.
+
+### Campaigns
+
+- `POST /campaigns` — create a campaign and one scheduled job per recipient (`201` / `200` replay)
+- `GET /campaigns/{id}` — `scheduled_at`, `sender`, `total_jobs`, per-status `counts`
+- `POST /campaigns/{id}/cancel` — cancel jobs for selected `recipient_ids` (1–1000 unique IDs)
+
+Campaign request body limit: **1 MiB** before JSON decode. Each template field (`subject`, `body`) up to **8 KiB**. Each rendered job payload still max **16 KiB**. Up to **1000** recipients per campaign when the request fits the body limit.
+
+Templates support variables `[name]` (`[A-Za-z_][A-Za-z0-9_]*`). Substitution runs once at create time in `subject` and `body`; values are plain strings (empty allowed). Escapes: `\\` → `\`, `\[` → `[`, `\]` → `]`. Any other `\` sequence or a bare `]` is a validation error. Literal brackets in JSON must double backslashes, for example:
+
+```json
+{"template":{"subject":"Hello \\[name\\]","body":"Plain text"}}
+```
+
+Campaign idempotency keys are stored on `campaigns.idempotency_key` (not on `jobs.idempotency_key`). Recipient order does not affect the content hash. Replaying after partial cancel returns the existing campaign without resuming canceled jobs.
+
+Targeted cancel returns `200` with per-recipient `canceled`, `already_canceled`, `too_late`, or `not_found` (request order preserved).
 
 ### Cancel a job
 
@@ -93,8 +116,9 @@ Worker skips terminal states (`succeeded`, `failed`, **`canceled`**) with Ack an
 ## Demo scripts
 
 ```bash
-python3 scripts/demo.py          # timing and idempotency
-python3 scripts/demo_cancel.py   # one job runs, one is canceled (API checks only)
+python3 scripts/demo.py            # timing and idempotency
+python3 scripts/demo_cancel.py     # one job runs, one is canceled (API checks only)
+python3 scripts/demo_campaign.py   # campaign, partial cancel, summary + idempotent replay
 ```
 
 Demos verify statuses and timestamps via GET; they do not count mock sender calls (integration tests do that with `recordingSender`).
@@ -111,7 +135,7 @@ Integration tests use paused worker claims, API assertions for cancel, race test
 
 ## Known limitations
 
-- No campaigns or template variables
+- No campaign edit or recurring campaigns
 - No automatic retry on sender failure
 - No recovery if a worker dies in `processing` after send may have started
 - Single outbox publisher assumed
