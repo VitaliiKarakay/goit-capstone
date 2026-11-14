@@ -71,6 +71,11 @@ services:
       DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
       NATS_URL: nats://nats:4222
       LOG_LEVEL: info
+      METRICS_ADDR: 0.0.0.0:9091
+      MOCK_SEND_DELAY: ${MOCK_SEND_DELAY:-}
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-}
+    expose:
+      - "9091"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -79,6 +84,33 @@ services:
     deploy:
       replicas: 2
     restart: unless-stopped
+
+  prometheus:
+    profiles: [monitoring]
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - controller
+
+  grafana:
+    profiles: [monitoring]
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   pgdata:

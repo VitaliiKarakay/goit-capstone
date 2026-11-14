@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/VitaliiKarakay/goit-capstone/internal/config"
 	natspub "github.com/VitaliiKarakay/goit-capstone/internal/messaging/nats"
+	"github.com/VitaliiKarakay/goit-capstone/internal/metrics"
 	"github.com/VitaliiKarakay/goit-capstone/internal/sender"
 	"github.com/VitaliiKarakay/goit-capstone/internal/storage/postgres"
 	"github.com/VitaliiKarakay/goit-capstone/internal/worker"
@@ -60,8 +63,35 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	log.Info("worker started", "worker_id", cfg.WorkerID)
-	runner := worker.New(log, store, sender.Mock{WorkerID: cfg.WorkerID, Logger: log}, cfg.WorkerID)
+	reg := metrics.NewRegistry()
+	wm := metrics.NewWorker(reg)
+	inner := sender.ConfigurableMock{
+		WorkerID:    cfg.WorkerID,
+		Logger:      log,
+		Delay:       cfg.Mock.SendDelay,
+		FailureRate: cfg.Mock.FailureRate,
+	}
+	send := metrics.Instrumented{Inner: inner, Worker: wm}
+
+	metricsSrv := &http.Server{
+		Addr:              cfg.MetricsAddr,
+		Handler:           metrics.Handler(reg),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Info("worker metrics listening", "addr", cfg.MetricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server", "err", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shutdownCtx)
+	}()
+
+	log.Info("worker started", "worker_id", cfg.WorkerID, "mock_delay", cfg.Mock.SendDelay.String(), "mock_failure_rate", cfg.Mock.FailureRate)
+	runner := worker.New(log, store, send, cfg.WorkerID)
 	return runner.Run(stopCtx, workCtx, bus.Pull)
 }
 

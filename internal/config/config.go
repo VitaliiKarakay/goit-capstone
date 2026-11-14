@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/VitaliiKarakay/goit-capstone/internal/sender"
 )
 
 type Controller struct {
@@ -16,6 +18,7 @@ type Controller struct {
 	OutboxInterval    time.Duration
 	OutboxBatch       int
 	LogLevel          string
+	MetricsDBRefresh  time.Duration
 }
 
 type Worker struct {
@@ -23,6 +26,8 @@ type Worker struct {
 	NATSURL     string
 	WorkerID    string
 	LogLevel    string
+	MetricsAddr string
+	Mock        sender.MockConfig
 }
 
 func LoadController() (Controller, error) {
@@ -52,6 +57,10 @@ func LoadController() (Controller, error) {
 	if cfg.OutboxBatch, err = positiveInt("OUTBOX_BATCH", cfg.OutboxBatch); err != nil {
 		return Controller{}, err
 	}
+	cfg.MetricsDBRefresh = 10 * time.Second
+	if cfg.MetricsDBRefresh, err = nonNegativeDuration("METRICS_DB_REFRESH_INTERVAL", cfg.MetricsDBRefresh, true); err != nil {
+		return Controller{}, err
+	}
 	return cfg, nil
 }
 
@@ -72,6 +81,12 @@ func LoadWorker() (Worker, error) {
 		}
 		cfg.WorkerID = host + "-" + strconv.Itoa(os.Getpid())
 	}
+	cfg.MetricsAddr = getenv("METRICS_ADDR", "0.0.0.0:9091")
+	mock, err := sender.LoadMockConfig()
+	if err != nil {
+		return Worker{}, err
+	}
+	cfg.Mock = mock
 	return cfg, nil
 }
 
@@ -80,6 +95,21 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func nonNegativeDuration(key string, fallback time.Duration, positiveDefault bool) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		if positiveDefault && fallback <= 0 {
+			return 0, fmt.Errorf("%s must be a positive duration", key)
+		}
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 || (positiveDefault && d <= 0) {
+		return 0, fmt.Errorf("%s must be a non-negative duration", key)
+	}
+	return d, nil
 }
 
 func duration(key string, fallback time.Duration) (time.Duration, error) {

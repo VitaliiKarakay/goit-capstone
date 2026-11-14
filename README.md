@@ -8,6 +8,8 @@ This repository implements a single-job scheduling pipeline: HTTP API, PostgreSQ
 
 **Iteration 4** adds a web UI at `/ui/` (English), list endpoints, and embeds the production build in the controller Docker image (`-tags embedui`). Recovery of stuck `processing` jobs is still out of scope.
 
+**Iteration 5** adds Prometheus metrics, a configurable mock sender (`MOCK_SEND_DELAY`, `MOCK_FAILURE_RATE`), and an optional Compose **`monitoring`** profile (Prometheus + Grafana). Metrics describe **database job state** and **mock sender invocations** — not real message delivery.
+
 ## Requirements
 
 - Go 1.25.5 (`GOTOOLCHAIN=local` recommended)
@@ -15,7 +17,7 @@ This repository implements a single-job scheduling pipeline: HTTP API, PostgreSQ
 - Python 3 for demo scripts
 - Node.js 22+ for local UI development (`web/`)
 
-Pinned images: PostgreSQL `17.11-alpine`, NATS `2.15.2-alpine`. Libraries: pgx v5.11.0, nats.go v1.53.1, goose v3.27.0.
+Pinned images: PostgreSQL `17.11-alpine`, NATS `2.15.2-alpine`, Prometheus `v2.55.1`, Grafana `11.4.0`. Libraries: pgx v5.11.0, nats.go v1.53.1, goose v3.27.0, prometheus/client_golang v1.22.0.
 
 Local credentials `scheduler` / `scheduler` are for this demo only.
 
@@ -149,6 +151,70 @@ python3 scripts/demo_campaign.py   # campaign, partial cancel, summary + idempot
 
 Demos verify statuses and timestamps via GET; they do not count mock sender calls (integration tests do that with `recordingSender`).
 
+## Metrics and mock sender
+
+### Mock environment (workers)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MOCK_SEND_DELAY` | `0` | Simulated send duration (non-negative). Honors request cancellation. |
+| `MOCK_FAILURE_RATE` | `0` | Probability in `[0,1]` of returning `ErrSimulatedSend` (job → `failed` in DB). Invalid values including NaN/Inf stop startup. |
+
+A successful mock `Send` only means the mock accepted the call. Job status `succeeded` in PostgreSQL means the worker recorded that outcome — still not real delivery.
+
+On worker shutdown, in-flight mock calls may be interrupted: the worker does **not** mark `failed` solely because the process is stopping; the JetStream message stays unacked. A job can remain in `processing` (known limitation; no recovery in this iteration).
+
+### HTTP endpoints
+
+| Process | Metrics URL |
+|---------|-------------|
+| Controller | `GET /metrics` on the API port (same as `/jobs`, `/campaigns`, `/ui/`) |
+| Worker | `GET /metrics` on `METRICS_ADDR` (default `0.0.0.0:9091` inside the container; not published on the host) |
+
+### Metric names (selection)
+
+**Controller (DB snapshot, refreshed on an interval — not on every scrape):** `scheduler_jobs_by_status{status=…}`, `scheduler_jobs_scheduled_future`, `scheduler_jobs_scheduled_overdue`, `scheduler_outbox_unpublished`, `scheduler_db_snapshot_success`, `scheduler_db_snapshot_last_success_timestamp_seconds`. Until the first successful refresh, job/outbox gauges are omitted (not exported as zero). Failed refresh sets `success=0` and keeps the previous snapshot.
+
+**Workers:** `scheduler_sender_invocations_total{result=success|simulated_error|context_canceled|error}`, `scheduler_sender_call_duration_seconds`, `scheduler_sender_start_lag_seconds` (from `send_started_at - scheduled_at` on the Send path), `scheduler_sender_calls_in_flight`. JetStream redeliveries without a Send call do not increment sender counters.
+
+Go runtime/process metrics are included on both processes.
+
+## Monitoring stack (optional profile)
+
+```bash
+export API_PORT=18080
+export MOCK_SEND_DELAY=500ms
+export MOCK_FAILURE_RATE=0
+
+docker compose --profile monitoring up --build -d --scale worker=1
+```
+
+Open **http://127.0.0.1:8080/ui/** (or your `API_PORT`), **http://127.0.0.1:9090** (Prometheus), **http://127.0.0.1:3000** (Grafana, `admin` / `admin`). Dashboard **“Scheduler / mock sender (not delivery)”** is provisioned automatically.
+
+After creating a large campaign in the UI and once jobs are due, scale workers (keep mock env vars in the shell):
+
+```bash
+docker compose --profile monitoring up -d --no-deps --scale worker=4 worker
+```
+
+Confirm four worker scrape targets:
+
+```bash
+curl -s 'http://127.0.0.1:9090/api/v1/targets' | jq '[.data.activeTargets[] | select(.labels.job=="scheduler-workers")] | length'
+```
+
+To demonstrate simulated sender errors after the previous campaign has finished, set `MOCK_FAILURE_RATE=1`, recreate workers so env is applied, run a separate campaign, then restore defaults:
+
+```bash
+export MOCK_FAILURE_RATE=1
+docker compose --profile monitoring up -d --no-deps --force-recreate worker
+# after demo
+export MOCK_FAILURE_RATE=0
+docker compose --profile monitoring up -d --no-deps --force-recreate worker
+```
+
+Base `docker compose up` without `--profile monitoring` works unchanged (default **two** worker replicas).
+
 ## Tests
 
 ```bash
@@ -163,6 +229,6 @@ Integration tests use paused worker claims, API assertions for cancel, race test
 
 - No campaign edit or recurring campaigns
 - No automatic retry on sender failure
-- No recovery if a worker dies in `processing` after send may have started
+- No recovery if a worker dies in `processing` after send may have started (including graceful shutdown interrupting an in-flight mock send)
 - Single outbox publisher assumed
 - JSON numbers `1` and `1.0` are different content for idempotency
