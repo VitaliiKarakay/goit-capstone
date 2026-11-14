@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
+	"github.com/VitaliiKarakay/goit-capstone/internal/uiembed"
 )
 
 const (
@@ -25,12 +26,15 @@ type JobRepository interface {
 	CreateJob(ctx context.Context, job domain.NewJob) (domain.Job, bool, error)
 	GetJob(ctx context.Context, id uuid.UUID) (domain.Job, error)
 	CancelJob(ctx context.Context, id uuid.UUID) (domain.Job, domain.CancelOutcome, error)
+	ListStandaloneJobs(ctx context.Context, status domain.Status, page domain.PageParams) (domain.JobListPage, error)
 }
 
 type CampaignRepository interface {
 	CreateCampaign(ctx context.Context, in domain.NewCampaign) (domain.CampaignSummary, bool, error)
 	GetCampaign(ctx context.Context, id uuid.UUID) (domain.CampaignSummary, error)
 	CancelCampaignRecipients(ctx context.Context, id uuid.UUID, recipientIDs []string) ([]domain.RecipientCancelOutcome, error)
+	ListCampaigns(ctx context.Context, page domain.PageParams) (domain.CampaignListPage, error)
+	ListCampaignJobs(ctx context.Context, campaignID uuid.UUID, status domain.Status, page domain.PageParams) (domain.CampaignJobListPage, error)
 }
 
 type Repository interface {
@@ -59,6 +63,24 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /jobs", a.listJobs)
+	mux.HandleFunc("GET /campaigns", a.listCampaigns)
+	mux.HandleFunc("GET /campaigns/{id}/jobs", a.listCampaignJobs)
+
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+	})
+	mux.HandleFunc("GET /ui", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+	})
+	if ui := uiembed.Handler(); ui != nil {
+		mux.Handle("GET /ui/", ui)
+	} else {
+		mux.HandleFunc("GET /ui/", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("UI not embedded; use Vite dev server or rebuild with -tags embedui"))
+		})
+	}
 	return mux
 }
 
@@ -313,12 +335,19 @@ type cancelResponse struct {
 	Result string `json:"result"`
 }
 
+type campaignTemplateResponse struct {
+	Subject string `json:"subject"`
+	Body    string `json:"body"`
+}
+
 type campaignResponse struct {
-	CampaignID  string         `json:"campaign_id"`
-	ScheduledAt string         `json:"scheduled_at"`
-	Sender      string         `json:"sender"`
-	TotalJobs   int            `json:"total_jobs"`
-	Counts      map[string]int `json:"counts"`
+	CampaignID  string                    `json:"campaign_id"`
+	ScheduledAt string                    `json:"scheduled_at"`
+	Sender      string                    `json:"sender"`
+	TotalJobs   int                       `json:"total_jobs"`
+	Counts      map[string]int            `json:"counts"`
+	Template    *campaignTemplateResponse `json:"template,omitempty"`
+	CreatedAt   string                    `json:"created_at,omitempty"`
 }
 
 type campaignCancelResponse struct {
@@ -340,13 +369,20 @@ func campaignView(c domain.CampaignSummary) campaignResponse {
 		string(domain.StatusFailed):     c.Counts[domain.StatusFailed],
 		string(domain.StatusCanceled):   c.Counts[domain.StatusCanceled],
 	}
-	return campaignResponse{
+	resp := campaignResponse{
 		CampaignID:  c.ID.String(),
 		ScheduledAt: domain.FormatTime(c.ScheduledAt),
 		Sender:      c.Sender,
 		TotalJobs:   c.TotalJobs,
 		Counts:      counts,
 	}
+	if c.TemplateSubject != "" || c.TemplateBody != "" {
+		resp.Template = &campaignTemplateResponse{Subject: c.TemplateSubject, Body: c.TemplateBody}
+	}
+	if !c.CreatedAt.IsZero() {
+		resp.CreatedAt = domain.FormatTime(c.CreatedAt)
+	}
+	return resp
 }
 
 func jobView(job domain.Job) jobResponse {

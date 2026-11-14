@@ -4,13 +4,16 @@ This repository implements a single-job scheduling pipeline: HTTP API, PostgreSQ
 
 **Iteration 2** adds canceling a single job via `POST /jobs/{id}/cancel`.
 
-**Iteration 3** adds campaigns with template variables and per-recipient cancel via `POST /campaigns/{id}/cancel`. Recovery of stuck `processing` jobs is still out of scope.
+**Iteration 3** adds campaigns with template variables and per-recipient cancel via `POST /campaigns/{id}/cancel`.
+
+**Iteration 4** adds a web UI at `/ui/` (English), list endpoints, and embeds the production build in the controller Docker image (`-tags embedui`). Recovery of stuck `processing` jobs is still out of scope.
 
 ## Requirements
 
 - Go 1.25.5 (`GOTOOLCHAIN=local` recommended)
 - Docker Compose v2
 - Python 3 for demo scripts
+- Node.js 22+ for local UI development (`web/`)
 
 Pinned images: PostgreSQL `17.11-alpine`, NATS `2.15.2-alpine`. Libraries: pgx v5.11.0, nats.go v1.53.1, goose v3.27.0.
 
@@ -22,7 +25,7 @@ Local credentials `scheduler` / `scheduler` are for this demo only.
 docker compose up --build
 ```
 
-Published on `127.0.0.1` only. API port defaults to `8080`:
+Published on `127.0.0.1` only. API port defaults to `8080`. After `docker compose up --build`, open **http://127.0.0.1:8080/ui/** (UI is embedded in the controller image).
 
 ```bash
 API_PORT=18080 docker compose up --build
@@ -51,6 +54,7 @@ go run ./cmd/worker
 ### Create and read jobs
 
 - `POST /jobs` — create a job (`201` + `Location`, or `200` idempotent replay)
+- `GET /jobs` — paginated standalone jobs (`campaign_id IS NULL`); query `status`, `limit` (default 20, max 100), `offset`
 - `GET /jobs/{id}` — full job view including `canceled_at` and `campaign_id` when set
 
 Request body limit: **64 KiB** before JSON decode. Payload object limit: **16 KiB**. `scheduled_at` must be RFC3339 with timezone; stored in UTC with microsecond truncation.
@@ -62,7 +66,9 @@ Idempotency: same `idempotency_key` and canonical content returns the same job (
 ### Campaigns
 
 - `POST /campaigns` — create a campaign and one scheduled job per recipient (`201` / `200` replay)
-- `GET /campaigns/{id}` — `scheduled_at`, `sender`, `total_jobs`, per-status `counts`
+- `GET /campaigns` — paginated campaign summaries with batched status counts
+- `GET /campaigns/{id}` — summary plus `template` and `created_at`
+- `GET /campaigns/{id}/jobs` — paginated campaign jobs; sort `recipient_id ASC, id ASC`; query `status`, `limit`, `offset`
 - `POST /campaigns/{id}/cancel` — cancel jobs for selected `recipient_ids` (1–1000 unique IDs)
 
 Campaign request body limit: **1 MiB** before JSON decode. Each template field (`subject`, `body`) up to **8 KiB**. Each rendered job payload still max **16 KiB**. Up to **1000** recipients per campaign when the request fits the body limit.
@@ -112,6 +118,21 @@ Codes include: `invalid_json`, `request_too_large`, `validation_error`, `idempot
 4. While handling a message, workers send JetStream **InProgress** periodically (10s in production) to extend `AckWait`.
 
 Worker skips terminal states (`succeeded`, `failed`, **`canceled`**) with Ack and no send.
+
+## Web UI
+
+- Routes under **`/ui/`** (e.g. `/ui/jobs`, `/ui/campaigns`). Root **`/`** redirects to `/ui/`.
+- API stays on `/jobs`, `/campaigns`, `/healthz` — unknown API paths return JSON errors, not the SPA.
+- **Production:** UI is embedded when the controller is built with `-tags embedui` (Dockerfile does this).
+- **Development:** without embed, `/ui/` returns a short notice; run Vite instead:
+
+```bash
+docker compose up -d postgres nats migrate controller worker
+cd web && npm install && npm run dev
+# open http://127.0.0.1:5173/ui/  (proxies API to :8080)
+```
+
+List responses omit full message payloads; open a job to load `GET /jobs/{id}`.
 
 ## Demo scripts
 

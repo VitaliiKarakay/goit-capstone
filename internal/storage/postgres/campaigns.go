@@ -114,11 +114,12 @@ func loadCampaignSummary(ctx context.Context, q interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }, id uuid.UUID) (domain.CampaignSummary, error) {
 	rows, err := q.Query(ctx, `
-		SELECT c.id::text, c.scheduled_at, c.sender, j.status, count(j.id)::int
+		SELECT c.id::text, c.scheduled_at, c.sender, c.template_subject, c.template_body, c.created_at,
+		       j.status, count(j.id)::int
 		FROM campaigns c
 		LEFT JOIN jobs j ON j.campaign_id = c.id
 		WHERE c.id = $1::uuid
-		GROUP BY c.id, c.scheduled_at, c.sender, j.status`,
+		GROUP BY c.id, c.scheduled_at, c.sender, c.template_subject, c.template_body, c.created_at, j.status`,
 		id.String(),
 	)
 	if err != nil {
@@ -128,14 +129,15 @@ func loadCampaignSummary(ctx context.Context, q interface {
 
 	var campaignID uuid.UUID
 	var scheduledAt time.Time
-	var sender string
+	var sender, templateSubject, templateBody string
+	var createdAt time.Time
 	counts := allStatusCounts()
 	total := 0
 	foundCampaign := false
 	for rows.Next() {
 		var cid, status string
 		var n int
-		if err := rows.Scan(&cid, &scheduledAt, &sender, &status, &n); err != nil {
+		if err := rows.Scan(&cid, &scheduledAt, &sender, &templateSubject, &templateBody, &createdAt, &status, &n); err != nil {
 			return domain.CampaignSummary{}, err
 		}
 		foundCampaign = true
@@ -157,11 +159,14 @@ func loadCampaignSummary(ctx context.Context, q interface {
 		return domain.CampaignSummary{}, domain.ErrCampaignNotFound
 	}
 	return domain.CampaignSummary{
-		ID:          campaignID,
-		ScheduledAt: scheduledAt,
-		Sender:      sender,
-		TotalJobs:   total,
-		Counts:      counts,
+		ID:              campaignID,
+		ScheduledAt:     scheduledAt,
+		Sender:          sender,
+		TotalJobs:       total,
+		Counts:          counts,
+		TemplateSubject: templateSubject,
+		TemplateBody:    templateBody,
+		CreatedAt:       createdAt,
 	}, nil
 }
 

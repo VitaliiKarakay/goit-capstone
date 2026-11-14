@@ -1,0 +1,148 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #f6f6f8;
+  color: #1a1a1a;
+}
+.layout {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1rem 1.5rem 3rem;
+}
+.header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.4rem;
+}
+.banner {
+  background: #fff3cd;
+  border: 1px solid #e6c200;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.9rem;
+  margin: 0.5rem 0 1rem;
+}
+nav a {
+  margin-right: 1rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  margin: 1rem 0;
+}
+th,
+td {
+  border-bottom: 1px solid #ddd;
+  padding: 0.5rem;
+  text-align: left;
+  font-size: 0.9rem;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.75rem 0;
+}
+.btn {
+  padding: 0.4rem 0.75rem;
+  border: 1px solid #888;
+  background: #fff;
+  cursor: pointer;
+}
+.btn.primary {
+  background: #1a5fb4;
+  color: #fff;
+  border-color: #1a5fb4;
+}
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.form label {
+  display: block;
+  margin: 0.5rem 0;
+}
+.form input,
+.form textarea,
+.form select {
+  display: block;
+  width: 100%;
+  max-width: 32rem;
+  margin-top: 0.25rem;
+}
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  background: #eee;
+}
+.st-succeeded {
+  background: #d4edda;
+}
+.st-canceled {
+  background: #e2e3e5;
+}
+.st-failed {
+  background: #f8d7da;
+}
+.st-processing,
+.st-queued {
+  background: #cce5ff;
+}
+.error {
+  color: #a00;
+}
+.warn {
+  color: #856404;
+}
+.empty {
+  color: #555;
+}
+.pager {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+.detail dt {
+  font-weight: 600;
+  margin-top: 0.5rem;
+}
+.preview {
+  background: #fff;
+  border: 1px solid #ddd;
+  padding: 0.75rem;
+  margin: 0.75rem 0;
+}
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.modal-body {
+  background: #fff;
+  padding: 1rem;
+  max-width: 28rem;
+  width: 90%;
+}
+.linkish {
+  background: none;
+  border: none;
+  color: #1a5fb4;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.hint {
+  font-size: 0.85rem;
+  color: #555;
+}
+.field-error {
+  color: #a00;
+  font-size: 0.85rem;
+}
