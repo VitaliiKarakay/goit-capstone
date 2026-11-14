@@ -29,5 +29,9 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+.DS_Store
+
+# Local agent handoff, not part of the project
+CURSOR_HANDOFF.md
