@@ -96,12 +96,21 @@ func (s instrumentedSlow) Send(ctx context.Context, job sender.Job) error {
 	}
 }
 
-func TestTerminalSkipNoWrapperCall(t *testing.T) {
-	// Instrumented only runs when Send is invoked from runner; this test documents counter isolation.
+func TestWorkerResultSeriesInitialized(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	wm := NewWorker(reg)
-	if v := testutil.ToFloat64(wm.Invocations.WithLabelValues("success")); v != 0 {
-		t.Fatal()
+	for _, result := range []string{"success", "simulated_error", "context_canceled", "error"} {
+		if v := testutil.ToFloat64(wm.Invocations.WithLabelValues(result)); v != 0 {
+			t.Fatalf("%s=%v", result, v)
+		}
+	}
+	rec := httptest.NewRecorder()
+	Handler(reg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body, _ := io.ReadAll(rec.Body)
+	for _, result := range []string{"success", "simulated_error", "context_canceled", "error"} {
+		if !strings.Contains(string(body), `result="`+result+`"`) {
+			t.Fatalf("missing series %s", result)
+		}
 	}
 }
 

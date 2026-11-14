@@ -189,7 +189,7 @@ export MOCK_FAILURE_RATE=0
 docker compose --profile monitoring up --build -d --scale worker=1
 ```
 
-Open **http://127.0.0.1:8080/ui/** (or your `API_PORT`), **http://127.0.0.1:9090** (Prometheus), **http://127.0.0.1:3000** (Grafana, `admin` / `admin`). Dashboard **“Scheduler / mock sender (not delivery)”** is provisioned automatically.
+Open **http://127.0.0.1:18080/ui/** when using `API_PORT=18080`, **http://127.0.0.1:9090** (Prometheus), **http://127.0.0.1:3000** (Grafana, `admin` / `admin`). Dashboard **“Scheduler / mock sender (not delivery)”** is provisioned automatically. Worker containers use `stop_grace_period: 30s` so in-flight mock sends (e.g. 12s) can finish before Docker sends SIGKILL after the default 10s stop window.
 
 After creating a large campaign in the UI and once jobs are due, scale workers (keep mock env vars in the shell):
 
@@ -197,10 +197,10 @@ After creating a large campaign in the UI and once jobs are due, scale workers (
 docker compose --profile monitoring up -d --no-deps --scale worker=4 worker
 ```
 
-Confirm four worker scrape targets:
+Confirm four **healthy** worker scrape targets:
 
 ```bash
-curl -s 'http://127.0.0.1:9090/api/v1/targets' | jq '[.data.activeTargets[] | select(.labels.job=="scheduler-workers")] | length'
+curl -s 'http://127.0.0.1:9090/api/v1/targets' | jq '[.data.activeTargets[] | select(.labels.job=="scheduler-workers" and .health=="up")] | length'
 ```
 
 To demonstrate simulated sender errors after the previous campaign has finished, set `MOCK_FAILURE_RATE=1`, recreate workers so env is applied, run a separate campaign, then restore defaults:
@@ -208,7 +208,8 @@ To demonstrate simulated sender errors after the previous campaign has finished,
 ```bash
 export MOCK_FAILURE_RATE=1
 docker compose --profile monitoring up -d --no-deps --force-recreate worker
-# after demo
+# after demo — restore mock defaults
+export MOCK_SEND_DELAY=0s
 export MOCK_FAILURE_RATE=0
 docker compose --profile monitoring up -d --no-deps --force-recreate worker
 ```

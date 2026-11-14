@@ -40,6 +40,9 @@ func NewWorker(reg prometheus.Registerer) *Worker {
 		}),
 	}
 	reg.MustRegister(w.Invocations, w.Duration, w.StartLag, w.InFlight)
+	for _, result := range []string{"success", "simulated_error", "context_canceled", "error"} {
+		w.Invocations.WithLabelValues(result).Add(0)
+	}
 	return w
 }
 

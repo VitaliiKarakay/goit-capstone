@@ -2,6 +2,7 @@
   "annotations": { "list": [] },
   "editable": true,
   "graphTooltip": 1,
+  "refresh": "5s",
   "panels": [
     {
       "title": "DB snapshot healthy",

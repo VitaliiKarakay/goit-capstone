@@ -67,6 +67,7 @@ services:
     build:
       context: .
       target: worker
+    stop_grace_period: 30s
     environment:
       DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
       NATS_URL: nats://nats:4222
