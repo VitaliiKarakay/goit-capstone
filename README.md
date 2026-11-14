@@ -70,6 +70,7 @@ Idempotency: same `idempotency_key` and canonical content returns the same job (
 - `GET /campaigns/{id}` — summary plus `template` and `created_at`
 - `GET /campaigns/{id}/jobs` — paginated campaign jobs; sort `recipient_id ASC, id ASC`; query `status`, `limit`, `offset`
 - `POST /campaigns/{id}/cancel` — cancel jobs for selected `recipient_ids` (1–1000 unique IDs)
+- `POST /campaigns/{id}/cancel-all` — cancel every `scheduled` / `queued` job in the campaign (**empty body**; non-empty → `400 invalid_json`)
 
 Campaign request body limit: **1 MiB** before JSON decode. Each template field (`subject`, `body`) up to **8 KiB**. Each rendered job payload still max **16 KiB**. Up to **1000** recipients per campaign when the request fits the body limit.
 
@@ -82,6 +83,8 @@ Templates support variables `[name]` (`[A-Za-z_][A-Za-z0-9_]*`). Substitution ru
 Campaign idempotency keys are stored on `campaigns.idempotency_key` (not on `jobs.idempotency_key`). Recipient order does not affect the content hash. Replaying after partial cancel returns the existing campaign without resuming canceled jobs.
 
 Targeted cancel returns `200` with per-recipient `canceled`, `already_canceled`, `too_late`, or `not_found` (request order preserved).
+
+Cancel-all acquires `FOR UPDATE` on the campaign row first (same as targeted cancel), then bulk-updates pending jobs. Response fields: `canceled_now`, `already_canceled`, `too_late`, `total_jobs` (the three categories sum to `total_jobs`). Replaying cancel-all after everything is pending-canceled returns `canceled_now: 0`. Mass cancel and targeted cancel on the same campaign serialize on the campaign lock; cancel still races worker **claim** on individual `queued` rows (winner decides `canceled` vs `too_late`).
 
 ### Cancel a job
 
@@ -133,6 +136,8 @@ cd web && npm install && npm run dev
 ```
 
 List responses omit full message payloads; open a job to load `GET /jobs/{id}`.
+
+Campaign detail offers **Cancel campaign** (`POST …/cancel-all`) when any job is still `scheduled` or `queued`; the summary panel shows the cancel-all counters, then counts and the job table refresh from the API.
 
 ## Demo scripts
 

@@ -92,6 +92,16 @@ type RecipientCancelOutcome struct {
 	Result      string
 }
 
+type CampaignCancelAllResult struct {
+	CampaignID      uuid.UUID
+	CanceledNow     int
+	AlreadyCanceled int
+	TooLate         int
+	TotalJobs       int
+}
+
+var ErrCampaignCancelInvariant = errors.New("campaign cancel accounting invariant failed")
+
 const (
 	CampaignCancelResultCanceled        = "canceled"
 	CampaignCancelResultAlreadyCanceled = "already_canceled"

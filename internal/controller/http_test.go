@@ -213,6 +213,19 @@ func (m *memStore) GetCampaign(_ context.Context, id uuid.UUID) (domain.Campaign
 	return m.campaign, nil
 }
 
+func (m *memStore) CancelCampaignAll(_ context.Context, id uuid.UUID) (domain.CampaignCancelAllResult, error) {
+	if m.campaign.ID != id {
+		return domain.CampaignCancelAllResult{}, domain.ErrCampaignNotFound
+	}
+	return domain.CampaignCancelAllResult{
+		CampaignID:      id,
+		CanceledNow:     m.campaign.TotalJobs,
+		AlreadyCanceled: 0,
+		TooLate:         0,
+		TotalJobs:       m.campaign.TotalJobs,
+	}, nil
+}
+
 func (m *memStore) CancelCampaignRecipients(_ context.Context, id uuid.UUID, ids []string) ([]domain.RecipientCancelOutcome, error) {
 	if m.campaign.ID != id {
 		return nil, domain.ErrCampaignNotFound

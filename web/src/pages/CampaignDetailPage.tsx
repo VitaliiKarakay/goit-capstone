@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { apiFetch } from "../api/client";
 import { StatusBadge, campaignPhase } from "../components/StatusBadge";
@@ -26,6 +26,14 @@ type JobPage = { items: JobRow[]; total: number; limit: number; offset: number }
 
 type CancelResult = { recipient_id: string; result: string };
 
+type CancelAllResult = {
+  campaign_id: string;
+  canceled_now: number;
+  already_canceled: number;
+  too_late: number;
+  total_jobs: number;
+};
+
 export function CampaignDetailPage() {
   const { id } = useParams();
   const [summary, setSummary] = useState<Campaign | null>(null);
@@ -35,17 +43,22 @@ export function CampaignDetailPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [cancelOut, setCancelOut] = useState<CancelResult[] | null>(null);
   const [jobDetail, setJobDetail] = useState<{ subject?: string; body?: string; to?: string } | null>(null);
+  const [cancelAllResult, setCancelAllResult] = useState<CancelAllResult | null>(null);
+  const [cancelAllBusy, setCancelAllBusy] = useState(false);
+  const dataEpoch = useRef(0);
   const limit = 20;
 
   const load = useCallback(
     async (signal: AbortSignal) => {
       if (!id) return;
+      const epoch = dataEpoch.current;
       const q = new URLSearchParams({ limit: String(limit), offset: String(offset) });
       if (statusFilter) q.set("status", statusFilter);
       const [camp, jobPage] = await Promise.all([
         apiFetch<Campaign>(`/campaigns/${id}`, undefined, signal),
         apiFetch<JobPage>(`/campaigns/${id}/jobs?${q}`, undefined, signal),
       ]);
+      if (epoch !== dataEpoch.current) return;
       setSummary(camp);
       setJobs(jobPage);
     },
@@ -63,6 +76,11 @@ export function CampaignDetailPage() {
     });
   }
 
+  async function reloadFresh() {
+    dataEpoch.current += 1;
+    await load(new AbortController().signal);
+  }
+
   async function cancelSelected() {
     if (!id || selected.size === 0) return;
     const res = await apiFetch<{ results: CancelResult[] }>(`/campaigns/${id}/cancel`, {
@@ -72,8 +90,34 @@ export function CampaignDetailPage() {
     });
     setCancelOut(res.results);
     setSelected(new Set());
-    await load(new AbortController().signal);
+    await reloadFresh();
   }
+
+  async function cancelAllCampaign() {
+    if (!id) return;
+    if (
+      !window.confirm(
+        "Cancel all pending jobs in this campaign? Jobs already processing or completed will not be affected.",
+      )
+    ) {
+      return;
+    }
+    setCancelAllBusy(true);
+    try {
+      const res = await apiFetch<CancelAllResult>(`/campaigns/${id}/cancel-all`, { method: "POST" });
+      setCancelAllResult(res);
+      setCancelOut(null);
+      setSelected(new Set());
+      await reloadFresh();
+    } catch (e) {
+      console.error(e);
+      setCancelAllResult(null);
+    } finally {
+      setCancelAllBusy(false);
+    }
+  }
+
+  const pendingCount = (summary?.counts.scheduled ?? 0) + (summary?.counts.queued ?? 0);
 
   async function openMessage(jobId: string) {
     const job = await apiFetch<{ payload: { to?: string; subject?: string; body?: string } }>(`/jobs/${jobId}`);
@@ -159,11 +203,28 @@ export function CampaignDetailPage() {
         }}
       />
       <div className="toolbar">
+        <button
+          type="button"
+          className="btn"
+          disabled={pendingCount === 0 || cancelAllBusy}
+          onClick={() => void cancelAllCampaign()}
+        >
+          {cancelAllBusy ? "Canceling…" : "Cancel campaign"}
+        </button>
         <button type="button" className="btn" disabled={selected.size === 0} onClick={() => void cancelSelected()}>
           Cancel selected ({selected.size})
         </button>
         <Link to="/campaigns">Back</Link>
       </div>
+      {cancelAllResult && (
+        <div className="preview">
+          <h3>Cancel campaign result</h3>
+          <p>
+            Newly canceled: {cancelAllResult.canceled_now}, already canceled: {cancelAllResult.already_canceled}, too
+            late: {cancelAllResult.too_late} (total jobs: {cancelAllResult.total_jobs})
+          </p>
+        </div>
+      )}
       {cancelOut && (
         <div className="preview">
           <h3>Cancel results</h3>

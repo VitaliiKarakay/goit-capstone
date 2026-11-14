@@ -181,6 +181,67 @@ func allStatusCounts() map[domain.Status]int {
 	}
 }
 
+func lockCampaignForCancel(ctx context.Context, tx pgx.Tx, campaignID uuid.UUID) error {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id::text FROM campaigns WHERE id = $1::uuid FOR UPDATE`, campaignID.String()).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrCampaignNotFound
+	}
+	return err
+}
+
+func (s *Store) CancelCampaignAll(ctx context.Context, campaignID uuid.UUID) (domain.CampaignCancelAllResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockCampaignForCancel(ctx, tx, campaignID); err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+
+	var canceledNow int
+	if err := tx.QueryRow(ctx, `
+		WITH updated AS (
+			UPDATE jobs
+			SET status = 'canceled', canceled_at = now(), updated_at = now()
+			WHERE campaign_id = $1::uuid AND status IN ('scheduled', 'queued')
+			RETURNING id
+		)
+		SELECT count(*)::int FROM updated`, campaignID.String()).Scan(&canceledNow); err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+
+	var totalJobs, allCanceled, tooLate int
+	err = tx.QueryRow(ctx, `
+		SELECT
+			count(*)::int,
+			count(*) FILTER (WHERE status = 'canceled')::int,
+			count(*) FILTER (WHERE status IN ('processing', 'succeeded', 'failed'))::int
+		FROM jobs
+		WHERE campaign_id = $1::uuid`, campaignID.String()).Scan(&totalJobs, &allCanceled, &tooLate)
+	if err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+
+	alreadyCanceled := allCanceled - canceledNow
+	if alreadyCanceled < 0 || canceledNow+alreadyCanceled+tooLate != totalJobs {
+		return domain.CampaignCancelAllResult{}, domain.ErrCampaignCancelInvariant
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+	return domain.CampaignCancelAllResult{
+		CampaignID:      campaignID,
+		CanceledNow:     canceledNow,
+		AlreadyCanceled: alreadyCanceled,
+		TotalJobs:       totalJobs,
+		TooLate:         tooLate,
+	}, nil
+}
+
 func (s *Store) CancelCampaignRecipients(ctx context.Context, campaignID uuid.UUID, recipientIDs []string) ([]domain.RecipientCancelOutcome, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -188,11 +249,7 @@ func (s *Store) CancelCampaignRecipients(ctx context.Context, campaignID uuid.UU
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT true FROM campaigns WHERE id = $1::uuid`, campaignID.String()).Scan(&exists); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrCampaignNotFound
-		}
+	if err := lockCampaignForCancel(ctx, tx, campaignID); err != nil {
 		return nil, err
 	}
 

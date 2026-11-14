@@ -33,6 +33,7 @@ type CampaignRepository interface {
 	CreateCampaign(ctx context.Context, in domain.NewCampaign) (domain.CampaignSummary, bool, error)
 	GetCampaign(ctx context.Context, id uuid.UUID) (domain.CampaignSummary, error)
 	CancelCampaignRecipients(ctx context.Context, id uuid.UUID, recipientIDs []string) ([]domain.RecipientCancelOutcome, error)
+	CancelCampaignAll(ctx context.Context, id uuid.UUID) (domain.CampaignCancelAllResult, error)
 	ListCampaigns(ctx context.Context, page domain.PageParams) (domain.CampaignListPage, error)
 	ListCampaignJobs(ctx context.Context, campaignID uuid.UUID, status domain.Status, page domain.PageParams) (domain.CampaignJobListPage, error)
 }
@@ -60,6 +61,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /campaigns", a.createCampaign)
 	mux.HandleFunc("GET /campaigns/{id}", a.getCampaign)
 	mux.HandleFunc("POST /campaigns/{id}/cancel", a.cancelCampaign)
+	mux.HandleFunc("POST /campaigns/{id}/cancel-all", a.cancelCampaignAll)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -273,6 +275,50 @@ func (a *API) getCampaign(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, campaignView(summary))
 }
 
+func (a *API) cancelCampaignAll(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeRequestTooLarge(w)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", "could not read request body", nil)
+		return
+	}
+	if len(bytes.TrimSpace(body)) > 0 {
+		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be empty", nil)
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "campaign not found", nil)
+		return
+	}
+	result, err := a.camp.CancelCampaignAll(r.Context(), id)
+	if errors.Is(err, domain.ErrCampaignNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "campaign not found", nil)
+		return
+	}
+	if errors.Is(err, domain.ErrCampaignCancelInvariant) {
+		a.log.Error("cancel campaign all invariant", "err", err, "campaign_id", id)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal error", nil)
+		return
+	}
+	if err != nil {
+		a.log.Error("cancel campaign all", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal error", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, campaignCancelAllResponse{
+		CampaignID:      result.CampaignID.String(),
+		CanceledNow:     result.CanceledNow,
+		AlreadyCanceled: result.AlreadyCanceled,
+		TooLate:         result.TooLate,
+		TotalJobs:       result.TotalJobs,
+	})
+}
+
 func (a *API) cancelCampaign(w http.ResponseWriter, r *http.Request) {
 	body, err := readBodyLimit(r, MaxBodyBytes)
 	if err != nil {
@@ -358,6 +404,14 @@ type campaignCancelResponse struct {
 type campaignCancelResult struct {
 	RecipientID string `json:"recipient_id"`
 	Result      string `json:"result"`
+}
+
+type campaignCancelAllResponse struct {
+	CampaignID      string `json:"campaign_id"`
+	CanceledNow     int    `json:"canceled_now"`
+	AlreadyCanceled int    `json:"already_canceled"`
+	TooLate         int    `json:"too_late"`
+	TotalJobs       int    `json:"total_jobs"`
 }
 
 func campaignView(c domain.CampaignSummary) campaignResponse {
