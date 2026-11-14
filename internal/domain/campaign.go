@@ -37,17 +37,70 @@ type NewCampaign struct {
 }
 
 type CampaignSummary struct {
+	ID              uuid.UUID
+	ScheduledAt     time.Time
+	Sender          string
+	TotalJobs       int
+	Counts          map[Status]int
+	TemplateSubject string
+	TemplateBody    string
+	CreatedAt       time.Time
+}
+
+type JobListItem struct {
 	ID          uuid.UUID
+	RecipientID string
+	Status      Status
 	ScheduledAt time.Time
-	Sender      string
-	TotalJobs   int
-	Counts      map[Status]int
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type CampaignJobListItem struct {
+	JobID       uuid.UUID
+	RecipientID string
+	Status      Status
+	ScheduledAt time.Time
+	LastError   *string
+	CanceledAt  *time.Time
+	FinishedAt  *time.Time
+}
+
+type JobListPage struct {
+	Items  []JobListItem
+	Total  int
+	Limit  int
+	Offset int
+}
+
+type CampaignListPage struct {
+	Items  []CampaignSummary
+	Total  int
+	Limit  int
+	Offset int
+}
+
+type CampaignJobListPage struct {
+	Items  []CampaignJobListItem
+	Total  int
+	Limit  int
+	Offset int
 }
 
 type RecipientCancelOutcome struct {
 	RecipientID string
 	Result      string
 }
+
+type CampaignCancelAllResult struct {
+	CampaignID      uuid.UUID
+	CanceledNow     int
+	AlreadyCanceled int
+	TooLate         int
+	TotalJobs       int
+}
+
+var ErrCampaignCancelInvariant = errors.New("campaign cancel accounting invariant failed")
 
 const (
 	CampaignCancelResultCanceled        = "canceled"

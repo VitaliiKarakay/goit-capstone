@@ -114,11 +114,12 @@ func loadCampaignSummary(ctx context.Context, q interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }, id uuid.UUID) (domain.CampaignSummary, error) {
 	rows, err := q.Query(ctx, `
-		SELECT c.id::text, c.scheduled_at, c.sender, j.status, count(j.id)::int
+		SELECT c.id::text, c.scheduled_at, c.sender, c.template_subject, c.template_body, c.created_at,
+		       j.status, count(j.id)::int
 		FROM campaigns c
 		LEFT JOIN jobs j ON j.campaign_id = c.id
 		WHERE c.id = $1::uuid
-		GROUP BY c.id, c.scheduled_at, c.sender, j.status`,
+		GROUP BY c.id, c.scheduled_at, c.sender, c.template_subject, c.template_body, c.created_at, j.status`,
 		id.String(),
 	)
 	if err != nil {
@@ -128,14 +129,15 @@ func loadCampaignSummary(ctx context.Context, q interface {
 
 	var campaignID uuid.UUID
 	var scheduledAt time.Time
-	var sender string
+	var sender, templateSubject, templateBody string
+	var createdAt time.Time
 	counts := allStatusCounts()
 	total := 0
 	foundCampaign := false
 	for rows.Next() {
 		var cid, status string
 		var n int
-		if err := rows.Scan(&cid, &scheduledAt, &sender, &status, &n); err != nil {
+		if err := rows.Scan(&cid, &scheduledAt, &sender, &templateSubject, &templateBody, &createdAt, &status, &n); err != nil {
 			return domain.CampaignSummary{}, err
 		}
 		foundCampaign = true
@@ -157,11 +159,14 @@ func loadCampaignSummary(ctx context.Context, q interface {
 		return domain.CampaignSummary{}, domain.ErrCampaignNotFound
 	}
 	return domain.CampaignSummary{
-		ID:          campaignID,
-		ScheduledAt: scheduledAt,
-		Sender:      sender,
-		TotalJobs:   total,
-		Counts:      counts,
+		ID:              campaignID,
+		ScheduledAt:     scheduledAt,
+		Sender:          sender,
+		TotalJobs:       total,
+		Counts:          counts,
+		TemplateSubject: templateSubject,
+		TemplateBody:    templateBody,
+		CreatedAt:       createdAt,
 	}, nil
 }
 
@@ -176,6 +181,67 @@ func allStatusCounts() map[domain.Status]int {
 	}
 }
 
+func lockCampaignForCancel(ctx context.Context, tx pgx.Tx, campaignID uuid.UUID) error {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id::text FROM campaigns WHERE id = $1::uuid FOR UPDATE`, campaignID.String()).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrCampaignNotFound
+	}
+	return err
+}
+
+func (s *Store) CancelCampaignAll(ctx context.Context, campaignID uuid.UUID) (domain.CampaignCancelAllResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockCampaignForCancel(ctx, tx, campaignID); err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+
+	var canceledNow int
+	if err := tx.QueryRow(ctx, `
+		WITH updated AS (
+			UPDATE jobs
+			SET status = 'canceled', canceled_at = now(), updated_at = now()
+			WHERE campaign_id = $1::uuid AND status IN ('scheduled', 'queued')
+			RETURNING id
+		)
+		SELECT count(*)::int FROM updated`, campaignID.String()).Scan(&canceledNow); err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+
+	var totalJobs, allCanceled, tooLate int
+	err = tx.QueryRow(ctx, `
+		SELECT
+			count(*)::int,
+			count(*) FILTER (WHERE status = 'canceled')::int,
+			count(*) FILTER (WHERE status IN ('processing', 'succeeded', 'failed'))::int
+		FROM jobs
+		WHERE campaign_id = $1::uuid`, campaignID.String()).Scan(&totalJobs, &allCanceled, &tooLate)
+	if err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+
+	alreadyCanceled := allCanceled - canceledNow
+	if alreadyCanceled < 0 || canceledNow+alreadyCanceled+tooLate != totalJobs {
+		return domain.CampaignCancelAllResult{}, domain.ErrCampaignCancelInvariant
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.CampaignCancelAllResult{}, err
+	}
+	return domain.CampaignCancelAllResult{
+		CampaignID:      campaignID,
+		CanceledNow:     canceledNow,
+		AlreadyCanceled: alreadyCanceled,
+		TotalJobs:       totalJobs,
+		TooLate:         tooLate,
+	}, nil
+}
+
 func (s *Store) CancelCampaignRecipients(ctx context.Context, campaignID uuid.UUID, recipientIDs []string) ([]domain.RecipientCancelOutcome, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -183,11 +249,7 @@ func (s *Store) CancelCampaignRecipients(ctx context.Context, campaignID uuid.UU
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT true FROM campaigns WHERE id = $1::uuid`, campaignID.String()).Scan(&exists); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrCampaignNotFound
-		}
+	if err := lockCampaignForCancel(ctx, tx, campaignID); err != nil {
 		return nil, err
 	}
 

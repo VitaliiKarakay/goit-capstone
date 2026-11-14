@@ -213,6 +213,19 @@ func (m *memStore) GetCampaign(_ context.Context, id uuid.UUID) (domain.Campaign
 	return m.campaign, nil
 }
 
+func (m *memStore) CancelCampaignAll(_ context.Context, id uuid.UUID) (domain.CampaignCancelAllResult, error) {
+	if m.campaign.ID != id {
+		return domain.CampaignCancelAllResult{}, domain.ErrCampaignNotFound
+	}
+	return domain.CampaignCancelAllResult{
+		CampaignID:      id,
+		CanceledNow:     m.campaign.TotalJobs,
+		AlreadyCanceled: 0,
+		TooLate:         0,
+		TotalJobs:       m.campaign.TotalJobs,
+	}, nil
+}
+
 func (m *memStore) CancelCampaignRecipients(_ context.Context, id uuid.UUID, ids []string) ([]domain.RecipientCancelOutcome, error) {
 	if m.campaign.ID != id {
 		return nil, domain.ErrCampaignNotFound
@@ -251,6 +264,32 @@ func (m *memStore) GetJob(_ context.Context, id uuid.UUID) (domain.Job, error) {
 		return domain.Job{}, domain.ErrNotFound
 	}
 	return m.saved, nil
+}
+
+func (m *memStore) ListStandaloneJobs(_ context.Context, _ domain.Status, page domain.PageParams) (domain.JobListPage, error) {
+	var items []domain.JobListItem
+	if m.saved.ID != uuid.Nil {
+		items = append(items, domain.JobListItem{
+			ID: m.saved.ID, RecipientID: m.saved.RecipientID, Status: m.saved.Status,
+			ScheduledAt: m.saved.ScheduledAt, CreatedAt: m.saved.CreatedAt, UpdatedAt: m.saved.UpdatedAt,
+		})
+	}
+	return domain.JobListPage{Items: items, Total: len(items), Limit: page.Limit, Offset: page.Offset}, nil
+}
+
+func (m *memStore) ListCampaigns(_ context.Context, page domain.PageParams) (domain.CampaignListPage, error) {
+	var items []domain.CampaignSummary
+	if m.campaign.ID != uuid.Nil {
+		items = append(items, m.campaign)
+	}
+	return domain.CampaignListPage{Items: items, Total: len(items), Limit: page.Limit, Offset: page.Offset}, nil
+}
+
+func (m *memStore) ListCampaignJobs(_ context.Context, id uuid.UUID, _ domain.Status, page domain.PageParams) (domain.CampaignJobListPage, error) {
+	if m.campaign.ID != id {
+		return domain.CampaignJobListPage{}, domain.ErrCampaignNotFound
+	}
+	return domain.CampaignJobListPage{Items: []domain.CampaignJobListItem{}, Total: 0, Limit: page.Limit, Offset: page.Offset}, nil
 }
 
 func (m *memStore) CancelJob(_ context.Context, id uuid.UUID) (domain.Job, domain.CancelOutcome, error) {

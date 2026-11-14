@@ -33,5 +33,8 @@ go.work.sum
 .vscode/
 .DS_Store
 
+web/node_modules/
+web/dist/
+
 # Local agent handoff, not part of the project
 CURSOR_HANDOFF.md
