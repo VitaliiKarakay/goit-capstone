@@ -10,7 +10,6 @@ import (
 
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 	"github.com/VitaliiKarakay/goit-capstone/internal/metrics"
-	"github.com/VitaliiKarakay/goit-capstone/internal/sender"
 )
 
 func TestRunnerMetricsSkipsCanceledWithoutSend(t *testing.T) {
@@ -72,31 +71,6 @@ func TestRunnerMetricsSingleSendDespiteFinishRetries(t *testing.T) {
 	}
 }
 
-func TestHandleCompletesTwelveSecondMockSend(t *testing.T) {
-	if testing.Short() {
-		t.Skip("12s mock send")
-	}
-	job := sampleJob()
-	store := &fakeStore{found: true, claimed: true, job: job}
-	send := &delayedSender{delay: 12 * time.Second}
-	runner := testRunner(store, send)
-
-	msg := &fakeMsg{data: []byte(job.ID.String())}
-	done := make(chan struct{})
-	go func() {
-		runner.handle(context.Background(), msg.data, msg)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(20 * time.Second):
-		t.Fatal("handler timed out")
-	}
-	if send.calls != 1 || store.finished != domain.StatusSucceeded || msg.acks != 1 {
-		t.Fatalf("calls=%d finish=%s acks=%d", send.calls, store.finished, msg.acks)
-	}
-}
-
 func newInstrumentedRunner(wm *metrics.Worker, send *fakeSender) *Runner {
 	inst := metrics.Instrumented{Inner: send, Worker: wm}
 	r := testRunner(&fakeStore{}, inst)
@@ -140,21 +114,4 @@ func histogramSamples(t *testing.T, reg *prometheus.Registry, name string) uint6
 		return total
 	}
 	return 0
-}
-
-type delayedSender struct {
-	delay time.Duration
-	calls int
-}
-
-func (d *delayedSender) Send(ctx context.Context, _ sender.Job) error {
-	d.calls++
-	timer := time.NewTimer(d.delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }

@@ -216,6 +216,20 @@ docker compose --profile monitoring up -d --no-deps --force-recreate worker
 
 Base `docker compose up` without `--profile monitoring` works unchanged (default **two** worker replicas).
 
+### Graceful stop with an in-flight mock send
+
+Unit tests do not simulate Docker SIGTERM. On a running Compose stack, with one worker and a 12s mock delay:
+
+```bash
+export API_PORT=18080
+export MOCK_SEND_DELAY=12s
+export MOCK_FAILURE_RATE=0
+docker compose up -d --no-deps --scale worker=1 worker
+API=http://127.0.0.1:18080 python3 scripts/verify_worker_graceful.py
+```
+
+The script creates a due job, waits until `send_started_at` is set, runs `docker stop -t 30` on the worker container (`stop_grace_period: 30s` in Compose), and expects the job to reach **`succeeded`**. Restart workers afterward if needed.
+
 ## Tests
 
 ```bash
