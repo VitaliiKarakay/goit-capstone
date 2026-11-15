@@ -98,16 +98,74 @@ def main():
     subprocess.run(["docker", "kill", "-s", "KILL", workers[0]], check=True)
 
     unknown_deadline = time.time() + 120
+    snapshot = None
     while time.time() < unknown_deadline:
         _, job = request("GET", f"/jobs/{job_id}")
         st = job.get("status")
         if st == "unknown":
+            snapshot = job
             print("job marked unknown after kill", job_id)
-            return
+            break
         if st in ("succeeded", "failed"):
             fail(f"unexpected terminal before recovery: {st}")
         time.sleep(0.5)
-    fail(f"job did not reach unknown: last status={job.get('status')}")
+    else:
+        fail(f"job did not reach unknown: last status={job.get('status')}")
+
+    started_before = snapshot.get("send_started_at")
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    subprocess.run(
+        compose_cmd(
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            "--scale",
+            "worker=1",
+            "worker",
+        ),
+        check=True,
+        cwd=root,
+        env={**os.environ, "MOCK_SEND_DELAY": "0s", "MOCK_FAILURE_RATE": "0"},
+    )
+
+    for wait in (15, 30, 45):
+        time.sleep(wait)
+        _, job = request("GET", f"/jobs/{job_id}")
+        if job.get("status") != "unknown":
+            fail(f"status changed to {job.get('status')} after {wait}s wait (want unknown)")
+        if job.get("send_started_at") != started_before:
+            fail("send_started_at changed after redelivery")
+
+    subprocess.run(
+        compose_cmd(
+            "exec",
+            "-T",
+            "postgres",
+            "psql",
+            "-U",
+            "scheduler",
+            "-d",
+            "scheduler",
+            "-c",
+            f"INSERT INTO outbox (job_id) VALUES ('{job_id}'::uuid);",
+        ),
+        check=True,
+        cwd=root,
+    )
+
+    redeliver_deadline = time.time() + 90
+    polls = 0
+    while time.time() < redeliver_deadline:
+        _, job = request("GET", f"/jobs/{job_id}")
+        polls += 1
+        if job.get("status") != "unknown":
+            fail(f"status={job.get('status')} after forced outbox redelivery (poll {polls})")
+        if job.get("send_started_at") != started_before:
+            fail("send_started_at changed after outbox redelivery")
+        time.sleep(2)
+    print("unknown stable after worker restart, NATS wait, and outbox redelivery", job_id)
 
 
 if __name__ == "__main__":
