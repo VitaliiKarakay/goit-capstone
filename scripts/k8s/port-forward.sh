@@ -18,14 +18,11 @@ fi
 
 echo "UI       http://127.0.0.1:${APP_PORT}/ui/"
 echo "Grafana  http://127.0.0.1:${GRAFANA_PORT}/ (admin/admin demo)"
-kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" \
-  port-forward --address 127.0.0.1 "svc/controller" "${APP_PORT}:8080" &
+kubectl_ns port-forward --address 127.0.0.1 "svc/controller" "${APP_PORT}:8080" &
 PID1=$!
-kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" \
-  port-forward --address 127.0.0.1 "svc/grafana" "${GRAFANA_PORT}:3000" &
+kubectl_ns port-forward --address 127.0.0.1 "svc/grafana" "${GRAFANA_PORT}:3000" &
 PID2=$!
-kubectl --context "$KUBE_CONTEXT" -n "$KUBE_NAMESPACE" \
-  port-forward --address 127.0.0.1 "svc/prometheus" "${PROM_PORT}:9090" &
+kubectl_ns port-forward --address 127.0.0.1 "svc/prometheus" "${PROM_PORT}:9090" &
 PID3=$!
 trap 'kill $PID1 $PID2 $PID3 2>/dev/null' EXIT
 wait

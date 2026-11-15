@@ -3,8 +3,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
-TAG="${IMAGE_TAG:-$(image_tag)}"
-scale_app_to_zero
+TAG="$(require_pinned_image_tag)"
+export IMAGE_TAG="$TAG"
+scale_app_workloads_to_zero
 
 kubectl_ns delete job migrate --ignore-not-found=true
 kubectl_ns wait --for=delete job/migrate --timeout=120s 2>/dev/null || true

@@ -286,11 +286,14 @@ Local cluster scripts never change your default `kubectl` context and **refuse t
 
 ```bash
 scripts/k8s/cluster-create.sh          # minikube -p scheduler-local --keep-context
-scripts/k8s/build-images.sh
-scripts/k8s/load-images.sh
+scripts/k8s/fetch-kubectl.sh           # optional: client v1.31.4 under scripts/k8s/bin/
+scripts/k8s/build-images.sh            # pins tag in scripts/k8s/.image-tag (dirty trees: one timestamp)
+scripts/k8s/load-images.sh             # uses the pinned tag
 scripts/k8s/deploy-up.sh               # infra → migrate job → app → monitoring
 scripts/k8s/port-forward.sh            # UI http://127.0.0.1:18080/ui/
 ```
+
+`build-images.sh` writes `scripts/k8s/.image-tag` so `load-images.sh` and `deploy-*` use the **same** tag without relying on `export` in the parent shell. Override once for the whole sequence with `IMAGE_TAG=…` before `build-images.sh`, or pass it through each command in the same shell.
 
 **Lifecycle**
 
@@ -300,9 +303,9 @@ scripts/k8s/port-forward.sh            # UI http://127.0.0.1:18080/ui/
 | `scripts/k8s/destroy-data.sh` | After stop, delete **PVCs** (explicit data wipe) |
 | `scripts/k8s/cluster-delete.sh` | `minikube delete -p scheduler-local` — destroys the profile and all data |
 
-**Upgrades:** `scripts/k8s/upgrade-app.sh` rebuilds images, runs migrations (scale-to-zero, wait, Job with timeout), then rolls app deployments. Image tag is `git` short SHA, or `SHA-dirty-UTC` when the tree is dirty.
+**Upgrades:** `scripts/k8s/upgrade-app.sh` rebuilds images (new pin file), loads, migrates (app scaled to zero; waits for controller/worker pods gone), then applies **app only** (`deploy-app.sh`). `deploy-monitoring.sh` applies Prometheus/Grafana only and does not change worker scale or app images.
 
-**Demos on K8s:** run `port-forward.sh` in another terminal, then use the same Python verifiers with `API=http://127.0.0.1:18080`. Helper checks: `scripts/k8s/verify-prometheus-targets.sh 2`, `scripts/k8s/scale-workers.sh 4`, `scripts/k8s/verify-kill-worker.sh <pod>` (SIGKILL via minikube node PID; checks `restartCount` and `lastState.terminated`).
+**Demos on K8s:** run `port-forward.sh`, then `API=http://127.0.0.1:<APP_LOCAL_PORT>` with `scripts/demo*.py`. **`verify_worker_graceful.py` and `verify_worker_recovery*.py` call Docker Compose** (`docker stop` / `docker kill`); they are not Kubernetes checks—use `kubectl` pod delete/SIGKILL helpers under `scripts/k8s/` (e.g. `verify-kill-worker.sh`) and the same HTTP API. Helper checks: `scripts/k8s/verify-prometheus-targets.sh 2`, `scripts/k8s/scale-workers.sh 4`.
 
 Grafana admin credentials are in the demo `scheduler-secrets` Secret (`admin` / `admin`). Worker **startup/readiness** probe HTTP `/metrics` only (no liveness yet). Controller runs **one replica** with `Recreate`.
 

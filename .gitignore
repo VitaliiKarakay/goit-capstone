@@ -40,3 +40,4 @@ web/dist/
 CURSOR_HANDOFF.md
 
 scripts/k8s/bin/kubectl
+scripts/k8s/.image-tag
