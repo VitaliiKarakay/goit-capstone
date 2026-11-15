@@ -278,6 +278,34 @@ docker compose up -d --scale worker=1 worker controller
 API=http://127.0.0.1:18080 python3 scripts/verify_worker_recovery_unknown.py
 ```
 
+## Local Kubernetes (minikube, `scheduler-local`)
+
+Local cluster scripts never change your default `kubectl` context and **refuse to run** unless `KUBE_CONTEXT=scheduler-local` (your EKS or other contexts are not touched).
+
+**Prerequisites:** Docker Desktop with at least **4 CPUs** and **6 GiB** memory for the profile (application requests for two workers: **500m CPU**, **1152 MiB** memory; limits **2.6 CPU**, **2304 MiB** — excluding Kubernetes system overhead). Profile API server: **Kubernetes v1.31.4**. Scripts use `scripts/k8s/bin/kubectl` (v1.31.4) when present (`scripts/k8s/fetch-kubectl.sh`); your default `kubectl` and `current-context` (e.g. EKS) are unchanged. If port **18080** is already used (e.g. Compose), set `APP_LOCAL_PORT` or use `port-forward.sh` on another port and `API=http://127.0.0.1:<port>` for demos.
+
+```bash
+scripts/k8s/cluster-create.sh          # minikube -p scheduler-local --keep-context
+scripts/k8s/build-images.sh
+scripts/k8s/load-images.sh
+scripts/k8s/deploy-up.sh               # infra → migrate job → app → monitoring
+scripts/k8s/port-forward.sh            # UI http://127.0.0.1:18080/ui/
+```
+
+**Lifecycle**
+
+| Command | Effect |
+|--------|--------|
+| `scripts/k8s/stop.sh` | Scale controller, worker, Prometheus, and Grafana to **0**; **keeps** namespace and PVCs |
+| `scripts/k8s/destroy-data.sh` | After stop, delete **PVCs** (explicit data wipe) |
+| `scripts/k8s/cluster-delete.sh` | `minikube delete -p scheduler-local` — destroys the profile and all data |
+
+**Upgrades:** `scripts/k8s/upgrade-app.sh` rebuilds images, runs migrations (scale-to-zero, wait, Job with timeout), then rolls app deployments. Image tag is `git` short SHA, or `SHA-dirty-UTC` when the tree is dirty.
+
+**Demos on K8s:** run `port-forward.sh` in another terminal, then use the same Python verifiers with `API=http://127.0.0.1:18080`. Helper checks: `scripts/k8s/verify-prometheus-targets.sh 2`, `scripts/k8s/scale-workers.sh 4`, `scripts/k8s/verify-kill-worker.sh <pod>` (SIGKILL via minikube node PID; checks `restartCount` and `lastState.terminated`).
+
+Grafana admin credentials are in the demo `scheduler-secrets` Secret (`admin` / `admin`). Worker **startup/readiness** probe HTTP `/metrics` only (no liveness yet). Controller runs **one replica** with `Recreate`.
+
 ## Tests
 
 ```bash

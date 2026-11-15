@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: scheduler
+
+resources:
+  - ../../base
+
+configMapGenerator:
+  - name: grafana-datasources
+    files:
+      - prometheus.yaml=../../../../monitoring/grafana/provisioning/datasources/prometheus.yml
+  - name: grafana-dashboards-provider
+    files:
+      - dashboards.yaml=../../grafana/dashboard-provider.yaml
+  - name: grafana-dashboard-scheduler
+    files:
+      - scheduler.json=../../../../monitoring/grafana/provisioning/dashboards/scheduler.json
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+images:
+  - name: scheduler/controller
+    newName: scheduler/controller
+    newTag: local-dev
+  - name: scheduler/worker
+    newName: scheduler/worker
+    newTag: local-dev
