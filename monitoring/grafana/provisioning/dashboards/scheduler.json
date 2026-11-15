@@ -1,0 +1,165 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "title": "DB snapshot healthy",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "scheduler_db_snapshot_success", "legendFormat": "success" }],
+      "description": "Database job aggregates are only trustworthy when this is 1."
+    },
+    {
+      "title": "Seconds since last DB snapshot",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "time() - scheduler_db_snapshot_last_success_timestamp_seconds",
+          "legendFormat": "age"
+        }
+      ]
+    },
+    {
+      "title": "Jobs by status (DB)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "scheduler_jobs_by_status",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "nullValueMode": "null"
+    },
+    {
+      "title": "Queued jobs",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "scheduler_jobs_by_status{status=\"queued\"}", "legendFormat": "queued" }
+      ],
+      "nullValueMode": "null"
+    },
+    {
+      "title": "Overdue scheduled (not yet queued)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "targets": [{ "expr": "scheduler_jobs_scheduled_overdue", "legendFormat": "overdue" }],
+      "nullValueMode": "null"
+    },
+    {
+      "title": "Unpublished outbox rows",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "targets": [{ "expr": "scheduler_outbox_unpublished", "legendFormat": "outbox" }],
+      "nullValueMode": "null"
+    },
+    {
+      "title": "Mock sender success rate (all workers)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum(rate(scheduler_sender_invocations_total{result=\"success\"}[1m]))",
+          "legendFormat": "mock accepted / sec"
+        }
+      ],
+      "description": "Counts mock Send successes, not real message delivery."
+    },
+    {
+      "title": "Mock simulated errors (all workers)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum(rate(scheduler_sender_invocations_total{result=\"simulated_error\"}[1m]))",
+          "legendFormat": "simulated failures / sec"
+        }
+      ]
+    },
+    {
+      "title": "Start lag p50 / p95 / p99 (mock Send path)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(scheduler_sender_start_lag_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(scheduler_sender_start_lag_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(scheduler_sender_start_lag_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "nullValueMode": "null",
+      "description": "send_started_at minus scheduled_at when mock Send runs."
+    },
+    {
+      "title": "Mock call duration p50 / p95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(scheduler_sender_call_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(scheduler_sender_call_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "nullValueMode": "null"
+    },
+    {
+      "title": "Active mock Send calls",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 27 },
+      "targets": [
+        { "expr": "sum(scheduler_sender_calls_in_flight)", "legendFormat": "in flight" }
+      ]
+    },
+    {
+      "title": "Worker targets up",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 8, "y": 27 },
+      "targets": [
+        { "expr": "count(up{job=\"scheduler-workers\"} == 1)", "legendFormat": "workers" }
+      ]
+    },
+    {
+      "title": "Worker CPU (process)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 10, "x": 12, "y": 27 },
+      "targets": [
+        {
+          "expr": "sum(rate(process_cpu_seconds_total{job=\"scheduler-workers\"}[1m])) by (instance)",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "Worker memory (process)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 10, "x": 12, "y": 33 },
+      "targets": [
+        {
+          "expr": "sum(process_resident_memory_bytes{job=\"scheduler-workers\"}) by (instance)",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["scheduler", "mock"],
+  "timezone": "browser",
+  "title": "Scheduler / mock sender (not delivery)",
+  "uid": "scheduler-mock",
+  "version": 1
+}

@@ -55,6 +55,11 @@ func NewAPI(log *slog.Logger, repo Repository) *API {
 
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	a.Register(mux)
+	return mux
+}
+
+func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /jobs", a.createJob)
 	mux.HandleFunc("POST /jobs/{id}/cancel", a.cancelJob)
 	mux.HandleFunc("GET /jobs/{id}", a.getJob)
@@ -83,7 +88,6 @@ func (a *API) Handler() http.Handler {
 			_, _ = w.Write([]byte("UI not embedded; use Vite dev server or rebuild with -tags embedui"))
 		})
 	}
-	return mux
 }
 
 func (a *API) createJob(w http.ResponseWriter, r *http.Request) {

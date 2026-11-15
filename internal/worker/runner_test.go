@@ -34,6 +34,37 @@ func TestDeliveryBudgetSurvivesAShortOutage(t *testing.T) {
 	}
 }
 
+func TestHandleSendInterruptedByShutdown(t *testing.T) {
+	job := sampleJob()
+	store := &fakeStore{found: true, claimed: true, job: job}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runner.handle(ctx, msg.data, msg)
+		close(done)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler hung")
+	}
+	if send.calls != 1 {
+		t.Fatalf("calls=%d", send.calls)
+	}
+	if store.finished != "" {
+		t.Fatalf("finished=%s", store.finished)
+	}
+	if msg.acks != 0 {
+		t.Fatalf("acks=%d", msg.acks)
+	}
+}
+
 func TestHandleRecordsFailureWithoutAnotherSend(t *testing.T) {
 	store := &fakeStore{found: true, claimed: true, job: sampleJob()}
 	send := &fakeSender{err: errors.New("mock rejected")}
@@ -288,6 +319,16 @@ type fakeSender struct {
 func (f *fakeSender) Send(context.Context, sender.Job) error {
 	f.calls++
 	return f.err
+}
+
+type blockingSender struct {
+	calls int
+}
+
+func (b *blockingSender) Send(ctx context.Context, _ sender.Job) error {
+	b.calls++
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 type fakeMsg struct {

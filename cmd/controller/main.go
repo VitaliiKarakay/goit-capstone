@@ -13,6 +13,7 @@ import (
 	"github.com/VitaliiKarakay/goit-capstone/internal/config"
 	"github.com/VitaliiKarakay/goit-capstone/internal/controller"
 	natspub "github.com/VitaliiKarakay/goit-capstone/internal/messaging/nats"
+	"github.com/VitaliiKarakay/goit-capstone/internal/metrics"
 	"github.com/VitaliiKarakay/goit-capstone/internal/storage/postgres"
 	"github.com/VitaliiKarakay/goit-capstone/internal/worker"
 )
@@ -63,12 +64,20 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	reg := metrics.NewRegistry()
+	dbSnap := metrics.NewDBSnapshot(log, reg, store, cfg.MetricsDBRefresh, 2*time.Second)
+	go dbSnap.Run(ctx)
+
 	go controller.RunScheduler(ctx, log, store, cfg.SchedulerInterval, cfg.SchedulerBatch)
 	go controller.RunOutbox(ctx, log, store, bus, cfg.OutboxInterval, cfg.OutboxBatch)
 
+	mux := http.NewServeMux()
+	controller.NewAPI(log, store).Register(mux)
+	mux.Handle("GET /metrics", metrics.Handler(reg))
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           controller.NewAPI(log, store).Handler(),
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

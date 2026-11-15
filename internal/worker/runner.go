@@ -180,8 +180,10 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 	attempt := *job.SendAttemptID
 	id := job.ID
 
+	var started time.Time
 	err := retryDB(ctx, r.retryDelays, func() error {
-		_, markErr := r.store.MarkSendStarted(ctx, id, attempt)
+		var markErr error
+		started, markErr = r.store.MarkSendStarted(ctx, id, attempt)
 		return markErr
 	})
 	if err != nil {
@@ -196,16 +198,26 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 		return
 	}
 
-	sendErr := r.sender.Send(ctx, sender.Job{ID: job.ID, RecipientID: job.RecipientID, Payload: job.Payload})
-	status := domain.StatusSucceeded
-	var lastError *string
+	sendErr := r.sender.Send(ctx, sender.Job{
+		ID:            job.ID,
+		RecipientID:   job.RecipientID,
+		Payload:       job.Payload,
+		ScheduledAt:   job.ScheduledAt,
+		SendStartedAt: started,
+	})
 	if sendErr != nil {
-		status = domain.StatusFailed
+		if ctx.Err() != nil {
+			r.log.Info("send interrupted by shutdown", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
+			return
+		}
+		status := domain.StatusFailed
 		text := sendErr.Error()
-		lastError = &text
+		lastError := &text
 		r.log.Error("sender failed", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
+		r.finishUntilDone(ctx, msg, id, status, lastError)
+		return
 	}
-	r.finishUntilDone(ctx, msg, id, status, lastError)
+	r.finishUntilDone(ctx, msg, id, domain.StatusSucceeded, nil)
 }
 
 // keepInProgress sends JetStream in-progress acks until stop is called or ctx ends.
