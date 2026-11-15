@@ -67,9 +67,11 @@ func run(log *slog.Logger) error {
 	reg := metrics.NewRegistry()
 	dbSnap := metrics.NewDBSnapshot(log, reg, store, cfg.MetricsDBRefresh, 2*time.Second)
 	go dbSnap.Run(ctx)
+	rec := metrics.NewRecovery(reg)
 
 	go controller.RunScheduler(ctx, log, store, cfg.SchedulerInterval, cfg.SchedulerBatch)
 	go controller.RunOutbox(ctx, log, store, bus, cfg.OutboxInterval, cfg.OutboxBatch)
+	go controller.RunRecovery(ctx, log, store, cfg.RecoveryInterval, cfg.RecoveryBatch, cfg.MaxClaimAttempts, rec.Observe)
 
 	mux := http.NewServeMux()
 	controller.NewAPI(log, store).Register(mux)

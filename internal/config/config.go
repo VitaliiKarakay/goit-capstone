@@ -19,15 +19,21 @@ type Controller struct {
 	OutboxBatch       int
 	LogLevel          string
 	MetricsDBRefresh  time.Duration
+	RecoveryInterval  time.Duration
+	RecoveryBatch     int
+	MaxClaimAttempts  int
 }
 
 type Worker struct {
-	DatabaseURL string
-	NATSURL     string
-	WorkerID    string
-	LogLevel    string
-	MetricsAddr string
-	Mock        sender.MockConfig
+	DatabaseURL     string
+	NATSURL         string
+	WorkerID        string
+	LogLevel        string
+	MetricsAddr     string
+	Mock            sender.MockConfig
+	LeaseDuration   time.Duration
+	LeaseRenewEvery time.Duration
+	SendTimeout     time.Duration
 }
 
 func LoadController() (Controller, error) {
@@ -61,6 +67,18 @@ func LoadController() (Controller, error) {
 	if cfg.MetricsDBRefresh, err = nonNegativeDuration("METRICS_DB_REFRESH_INTERVAL", cfg.MetricsDBRefresh, true); err != nil {
 		return Controller{}, err
 	}
+	cfg.RecoveryInterval = 5 * time.Second
+	if cfg.RecoveryInterval, err = duration("RECOVERY_INTERVAL", cfg.RecoveryInterval); err != nil {
+		return Controller{}, err
+	}
+	cfg.RecoveryBatch = 50
+	if cfg.RecoveryBatch, err = positiveInt("RECOVERY_BATCH", cfg.RecoveryBatch); err != nil {
+		return Controller{}, err
+	}
+	cfg.MaxClaimAttempts = 5
+	if cfg.MaxClaimAttempts, err = positiveInt("MAX_CLAIM_ATTEMPTS", cfg.MaxClaimAttempts); err != nil {
+		return Controller{}, err
+	}
 	return cfg, nil
 }
 
@@ -87,6 +105,18 @@ func LoadWorker() (Worker, error) {
 		return Worker{}, err
 	}
 	cfg.Mock = mock
+	cfg.LeaseDuration = 45 * time.Second
+	if cfg.LeaseDuration, err = duration("WORKER_LEASE_DURATION", cfg.LeaseDuration); err != nil {
+		return Worker{}, err
+	}
+	cfg.LeaseRenewEvery = 10 * time.Second
+	if cfg.LeaseRenewEvery, err = duration("WORKER_LEASE_RENEW_INTERVAL", cfg.LeaseRenewEvery); err != nil {
+		return Worker{}, err
+	}
+	cfg.SendTimeout = 90 * time.Second
+	if cfg.SendTimeout, err = duration("WORKER_SEND_TIMEOUT", cfg.SendTimeout); err != nil {
+		return Worker{}, err
+	}
 	return cfg, nil
 }
 

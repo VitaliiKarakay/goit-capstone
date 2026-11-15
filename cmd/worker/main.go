@@ -92,6 +92,7 @@ func run(log *slog.Logger) error {
 
 	log.Info("worker started", "worker_id", cfg.WorkerID, "mock_delay", cfg.Mock.SendDelay.String(), "mock_failure_rate", cfg.Mock.FailureRate)
 	runner := worker.New(log, store, send, cfg.WorkerID)
+	runner.SetLeasePolicy(cfg.LeaseDuration, cfg.LeaseRenewEvery, cfg.SendTimeout)
 	return runner.Run(stopCtx, workCtx, bus.Pull)
 }
 

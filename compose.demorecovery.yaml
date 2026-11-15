@@ -1,0 +1,8 @@
+# Demo build: worker pauses after Claim when RECOVERY_DEMO_PAUSE_AFTER_CLAIM=1 (SIGKILL crash scenario).
+services:
+  worker:
+    build:
+      context: .
+      target: worker-demorecovery
+    environment:
+      RECOVERY_DEMO_PAUSE_AFTER_CLAIM: "1"

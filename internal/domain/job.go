@@ -19,6 +19,14 @@ const (
 	StatusSucceeded  Status = "succeeded"
 	StatusFailed     Status = "failed"
 	StatusCanceled   Status = "canceled"
+	StatusUnknown    Status = "unknown"
+)
+
+// Terminal error / outcome codes stored in last_error when applicable.
+const (
+	LastErrorSendTimeout                  = "send_timeout"
+	LastErrorMaxClaimAttempts             = "max_claim_attempts_exceeded"
+	LastErrorLeaseExpiredAfterSendStarted = "lease_expired_after_send_started"
 )
 
 var (
@@ -26,6 +34,7 @@ var (
 	ErrConflict      = errors.New("idempotency conflict")
 	ErrNotProcessing = errors.New("job is not processing")
 	ErrTooLate       = errors.New("cancel too late")
+	ErrLeaseLost     = errors.New("job lease lost")
 )
 
 type CancelOutcome string
@@ -63,6 +72,17 @@ type Job struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	FinishedAt     *time.Time
+	LeaseUntil     *time.Time
+	ClaimCount     int
+}
+
+func (s Status) Terminal() bool {
+	switch s {
+	case StatusSucceeded, StatusFailed, StatusCanceled, StatusUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 type NewJob struct {

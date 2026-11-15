@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,57 @@ func TestDeliveryBudgetSurvivesAShortOutage(t *testing.T) {
 	}
 	if AckWait <= inProcess {
 		t.Fatal("ack wait must outlast the in-process database retries")
+	}
+}
+
+func TestRenewLeaseLossStopsAttemptWithoutFinish(t *testing.T) {
+	job := sampleJob()
+	store := &fakeStore{found: true, claimed: true, job: job, renewErr: domain.ErrLeaseLost}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.SetLeasePolicy(time.Minute, 20*time.Millisecond, time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		runner.handle(context.Background(), msg.data, msg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler hung")
+	}
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
+	}
+	if store.finished != "" {
+		t.Fatalf("finished=%s", store.finished)
+	}
+}
+
+func TestDuplicateDeliveryDoesNotDoubleSend(t *testing.T) {
+	job := sampleJob()
+	store := &fakeStore{found: true, claimed: true, job: job}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runner.handle(ctx, msg.data, msg)
+		}()
+	}
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	wg.Wait()
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
 	}
 }
 
@@ -235,7 +287,7 @@ func TestHandleDelaysWhenDatabaseIsDown(t *testing.T) {
 }
 
 func testRunner(store Store, send sender.Sender) *Runner {
-	return &Runner{
+	r := &Runner{
 		log:         slog.New(slog.DiscardHandler),
 		store:       store,
 		sender:      send,
@@ -243,11 +295,14 @@ func testRunner(store Store, send sender.Sender) *Runner {
 		retryDelays: DBRetryDelays,
 		nakDelay:    NakDelay,
 	}
+	r.SetLeasePolicy(DefaultLeaseDuration, DefaultLeaseRenewInterval, DefaultSendTimeout)
+	return r
 }
 
 func sampleJob() domain.Job {
 	attempt := uuid.New()
 	owner := "worker-test"
+	lease := time.Now().UTC().Add(time.Minute)
 	return domain.Job{
 		ID:            uuid.New(),
 		RecipientID:   "user-1",
@@ -255,6 +310,7 @@ func sampleJob() domain.Job {
 		Payload:       []byte(`{"to":"a","subject":"s","body":"b"}`),
 		SendAttemptID: &attempt,
 		WorkerID:      &owner,
+		LeaseUntil:    &lease,
 	}
 }
 
@@ -265,6 +321,7 @@ func dialErr() error {
 type fakeStore struct {
 	claimErr        error
 	markErr         error
+	renewErr        error
 	spuriousMarkErr bool
 	finishFails     int
 	finishCalls     int
@@ -276,14 +333,21 @@ type fakeStore struct {
 	last            *string
 }
 
-func (f *fakeStore) Claim(context.Context, uuid.UUID, string) (domain.Job, bool, bool, error) {
+func (f *fakeStore) RenewLease(context.Context, uuid.UUID, uuid.UUID, string, time.Duration) error {
+	if f.renewErr != nil {
+		return f.renewErr
+	}
+	return nil
+}
+
+func (f *fakeStore) Claim(context.Context, uuid.UUID, string, time.Duration) (domain.Job, bool, bool, error) {
 	if f.claimErr != nil {
 		return domain.Job{}, false, false, f.claimErr
 	}
 	return f.job, f.found, f.claimed, nil
 }
 
-func (f *fakeStore) MarkSendStarted(_ context.Context, id, attempt uuid.UUID) (time.Time, error) {
+func (f *fakeStore) MarkSendStarted(_ context.Context, id, attempt uuid.UUID, _ string) (time.Time, error) {
 	if f.job.SendAttemptID == nil || attempt != *f.job.SendAttemptID {
 		return time.Time{}, domain.ErrNotProcessing
 	}
@@ -301,7 +365,7 @@ func (f *fakeStore) MarkSendStarted(_ context.Context, id, attempt uuid.UUID) (t
 	return time.Now().UTC(), nil
 }
 
-func (f *fakeStore) Finish(_ context.Context, _ uuid.UUID, status domain.Status, lastError *string) error {
+func (f *fakeStore) FinishAttempt(_ context.Context, _ uuid.UUID, _ uuid.UUID, _ string, status domain.Status, lastError *string) error {
 	f.finishCalls++
 	if f.finishFails > 0 && f.finishCalls <= f.finishFails {
 		return dialErr()

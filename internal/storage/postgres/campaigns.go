@@ -178,6 +178,7 @@ func allStatusCounts() map[domain.Status]int {
 		domain.StatusSucceeded:  0,
 		domain.StatusFailed:     0,
 		domain.StatusCanceled:   0,
+		domain.StatusUnknown:    0,
 	}
 }
 
@@ -218,7 +219,7 @@ func (s *Store) CancelCampaignAll(ctx context.Context, campaignID uuid.UUID) (do
 		SELECT
 			count(*)::int,
 			count(*) FILTER (WHERE status = 'canceled')::int,
-			count(*) FILTER (WHERE status IN ('processing', 'succeeded', 'failed'))::int
+			count(*) FILTER (WHERE status IN ('processing', 'succeeded', 'failed', 'unknown'))::int
 		FROM jobs
 		WHERE campaign_id = $1::uuid`, campaignID.String()).Scan(&totalJobs, &allCanceled, &tooLate)
 	if err != nil {

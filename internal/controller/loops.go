@@ -8,11 +8,16 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 	"github.com/VitaliiKarakay/goit-capstone/internal/storage/postgres"
 )
 
 type dueQueue interface {
 	QueueDue(ctx context.Context, limit int) (int, error)
+}
+
+type leaseRecovery interface {
+	RecoverExpiredLeases(ctx context.Context, batch, maxClaimAttempts int) (domain.RecoveryStats, error)
 }
 
 type outboxStore interface {
@@ -61,6 +66,22 @@ func RunOutbox(ctx context.Context, log *slog.Logger, store outboxStore, bus job
 				return
 			}
 			log.Info("outbox published", "outbox_id", msg.ID, "job_id", msg.JobID.String())
+		}
+	})
+}
+
+func RunRecovery(ctx context.Context, log *slog.Logger, store leaseRecovery, interval time.Duration, batch, maxClaims int, observe func(domain.RecoveryStats)) {
+	runLoop(ctx, interval, func() {
+		stats, err := store.RecoverExpiredLeases(ctx, batch, maxClaims)
+		if err != nil {
+			log.Error("recovery", "err", err)
+			return
+		}
+		if stats.Requeued > 0 || stats.Unknown > 0 || stats.ClaimExhausted > 0 {
+			log.Info("recovery", "requeued", stats.Requeued, "unknown", stats.Unknown, "claim_exhausted", stats.ClaimExhausted)
+		}
+		if observe != nil {
+			observe(stats)
 		}
 	})
 }

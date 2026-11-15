@@ -15,7 +15,7 @@ type JobRow = {
 
 type Page = { items: JobRow[]; total: number; limit: number; offset: number };
 
-const STATUSES = ["", "scheduled", "queued", "processing", "succeeded", "failed", "canceled"];
+const STATUSES = ["", "scheduled", "queued", "processing", "succeeded", "failed", "canceled", "unknown"];
 
 export function JobListPage() {
   const [status, setStatus] = useState("");

@@ -12,7 +12,7 @@ import (
 	"github.com/VitaliiKarakay/goit-capstone/internal/domain"
 )
 
-const jobColumns = `id::text, idempotency_key, campaign_id::text, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, send_attempt_id::text, canceled_at, created_at, updated_at, finished_at`
+const jobColumns = `id::text, idempotency_key, campaign_id::text, recipient_id, scheduled_at, sender, payload::text, status, worker_id, last_error, send_started_at, send_attempt_id::text, canceled_at, created_at, updated_at, finished_at, lease_until, claim_count`
 
 type OutboxMessage struct {
 	ID    int64
@@ -92,7 +92,7 @@ func cancelJobTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) (domain.Job, doma
 	switch job.Status {
 	case domain.StatusCanceled:
 		return job, domain.CancelOutcomeAlreadyCanceled, nil
-	case domain.StatusProcessing, domain.StatusSucceeded, domain.StatusFailed:
+	case domain.StatusProcessing, domain.StatusSucceeded, domain.StatusFailed, domain.StatusUnknown:
 		return domain.Job{}, "", domain.ErrTooLate
 	case domain.StatusScheduled, domain.StatusQueued:
 		job, err = scanJob(tx.QueryRow(ctx, `
@@ -203,12 +203,17 @@ func (s *Store) MarkPublished(ctx context.Context, id int64) error {
 }
 
 // Claim reports whether the row existed and whether this call won the queued → processing update.
-func (s *Store) Claim(ctx context.Context, id uuid.UUID, workerID string) (domain.Job, bool, bool, error) {
+func (s *Store) Claim(ctx context.Context, id uuid.UUID, workerID string, lease time.Duration) (domain.Job, bool, bool, error) {
 	job, err := scanJob(s.pool.QueryRow(ctx, `
 		UPDATE jobs
-		SET status = 'processing', worker_id = $2, send_attempt_id = gen_random_uuid(), updated_at = now()
+		SET status = 'processing',
+		    worker_id = $2,
+		    send_attempt_id = gen_random_uuid(),
+		    claim_count = claim_count + 1,
+		    lease_until = clock_timestamp() + $3::interval,
+		    updated_at = clock_timestamp()
 		WHERE id = $1::uuid AND status = 'queued'
-		RETURNING `+jobColumns, id.String(), workerID))
+		RETURNING `+jobColumns, id.String(), workerID, lease.String()))
 	if err == nil {
 		return job, true, true, nil
 	}
@@ -225,14 +230,31 @@ func (s *Store) Claim(ctx context.Context, id uuid.UUID, workerID string) (domai
 	return job, true, false, nil
 }
 
-func (s *Store) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error) {
+func (s *Store) RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE jobs
+		SET lease_until = clock_timestamp() + $4::interval, updated_at = clock_timestamp()
+		WHERE id = $1::uuid AND worker_id = $2 AND send_attempt_id = $3::uuid
+		  AND status = 'processing' AND lease_until > clock_timestamp()`,
+		id.String(), workerID, attempt.String(), lease.String())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrLeaseLost
+	}
+	return nil
+}
+
+func (s *Store) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID, workerID string) (time.Time, error) {
 	var started time.Time
 	err := s.pool.QueryRow(ctx, `
 		UPDATE jobs
-		SET send_started_at = now(), updated_at = now()
-		WHERE id = $1::uuid AND status = 'processing' AND send_attempt_id = $2::uuid AND send_started_at IS NULL
+		SET send_started_at = clock_timestamp(), updated_at = clock_timestamp()
+		WHERE id = $1::uuid AND status = 'processing' AND send_attempt_id = $2::uuid AND worker_id = $3
+		  AND send_started_at IS NULL AND lease_until > clock_timestamp()
 		RETURNING send_started_at
-	`, id.String(), attempt.String()).Scan(&started)
+	`, id.String(), attempt.String(), workerID).Scan(&started)
 	if err == nil {
 		return started, nil
 	}
@@ -242,28 +264,30 @@ func (s *Store) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (tim
 	err = s.pool.QueryRow(ctx, `
 		SELECT send_started_at
 		FROM jobs
-		WHERE id = $1::uuid AND status = 'processing' AND send_attempt_id = $2::uuid AND send_started_at IS NOT NULL
-	`, id.String(), attempt.String()).Scan(&started)
+		WHERE id = $1::uuid AND status = 'processing' AND send_attempt_id = $2::uuid AND worker_id = $3
+		  AND send_started_at IS NOT NULL AND lease_until > clock_timestamp()
+	`, id.String(), attempt.String(), workerID).Scan(&started)
 	if err == nil {
 		return started, nil
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, domain.ErrNotProcessing
+		return time.Time{}, domain.ErrLeaseLost
 	}
 	return time.Time{}, err
 }
 
-func (s *Store) Finish(ctx context.Context, id uuid.UUID, status domain.Status, lastError *string) error {
+func (s *Store) FinishAttempt(ctx context.Context, id, attempt uuid.UUID, workerID string, status domain.Status, lastError *string) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE jobs
-		SET status = $2, last_error = $3, finished_at = now(), updated_at = now()
-		WHERE id = $1::uuid AND status = 'processing'
-	`, id.String(), string(status), lastError)
+		SET status = $4, last_error = $5, finished_at = clock_timestamp(), updated_at = clock_timestamp(), lease_until = NULL
+		WHERE id = $1::uuid AND status = 'processing' AND send_attempt_id = $2::uuid AND worker_id = $3
+		  AND lease_until > clock_timestamp()`,
+		id.String(), attempt.String(), workerID, string(status), lastError)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return domain.ErrNotProcessing
+		return domain.ErrLeaseLost
 	}
 	return nil
 }
@@ -277,7 +301,8 @@ func (s *Store) jobByKey(ctx context.Context, key string) (domain.Job, []byte, e
 	var campaignID *string
 	err := row.Scan(
 		&id, &job.IdempotencyKey, &campaignID, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
-		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CanceledAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt, &hash,
+		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CanceledAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt,
+		&job.LeaseUntil, &job.ClaimCount, &hash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Job{}, nil, domain.ErrNotFound
@@ -309,6 +334,7 @@ func scanJob(row pgx.Row) (domain.Job, error) {
 	err := row.Scan(
 		&id, &job.IdempotencyKey, &campaignID, &job.RecipientID, &job.ScheduledAt, &job.Sender, &payload, &status,
 		&job.WorkerID, &job.LastError, &job.SendStartedAt, &attempt, &job.CanceledAt, &job.CreatedAt, &job.UpdatedAt, &job.FinishedAt,
+		&job.LeaseUntil, &job.ClaimCount,
 	)
 	if err != nil {
 		return domain.Job{}, err

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,9 +17,10 @@ import (
 )
 
 type Store interface {
-	Claim(ctx context.Context, id uuid.UUID, workerID string) (domain.Job, bool, bool, error)
-	MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error)
-	Finish(ctx context.Context, id uuid.UUID, status domain.Status, lastError *string) error
+	Claim(ctx context.Context, id uuid.UUID, workerID string, lease time.Duration) (domain.Job, bool, bool, error)
+	RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) error
+	MarkSendStarted(ctx context.Context, id, attempt uuid.UUID, workerID string) (time.Time, error)
+	FinishAttempt(ctx context.Context, id, attempt uuid.UUID, workerID string, status domain.Status, lastError *string) error
 }
 
 type Stats struct {
@@ -35,6 +37,10 @@ type Runner struct {
 	retryDelays      []time.Duration
 	nakDelay         time.Duration
 	progressInterval time.Duration
+	leaseDuration    time.Duration
+	leaseRenewEvery  time.Duration
+	sendTimeout      time.Duration
+	inflight         sync.Map
 	Stats            Stats
 }
 
@@ -47,12 +53,24 @@ func New(log *slog.Logger, store Store, send sender.Sender, workerID string) *Ru
 		retryDelays:      DBRetryDelays,
 		nakDelay:         NakDelay,
 		progressInterval: AckProgressInterval,
+		leaseDuration:    DefaultLeaseDuration,
+		leaseRenewEvery:  DefaultLeaseRenewInterval,
+		sendTimeout:      DefaultSendTimeout,
 	}
 }
 
-// Run pulls from the shared durable consumer until stop is cancelled.
-// work stays active for an in-flight message after stop, so a handler can finish.
-// pull is called again after a fetch error so a dropped broker connection can recover.
+func (r *Runner) SetLeasePolicy(lease, renewEvery, sendTimeout time.Duration) {
+	if lease > 0 {
+		r.leaseDuration = lease
+	}
+	if renewEvery > 0 {
+		r.leaseRenewEvery = renewEvery
+	}
+	if sendTimeout > 0 {
+		r.sendTimeout = sendTimeout
+	}
+}
+
 func (r *Runner) Run(stop, work context.Context, pull func() (*nats.Subscription, error)) error {
 	sub, err := pull()
 	if err != nil {
@@ -110,7 +128,7 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 	var found, claimed bool
 	err = retryDB(ctx, r.retryDelays, func() error {
 		var claimErr error
-		job, found, claimed, claimErr = r.store.Claim(ctx, id, r.workerID)
+		job, found, claimed, claimErr = r.store.Claim(ctx, id, r.workerID, r.leaseDuration)
 		return claimErr
 	})
 	if err != nil {
@@ -129,36 +147,50 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 		r.followUp(ctx, msg, job)
 		return
 	}
+	maybePauseAfterClaim()
+	if !r.tryInflight(job.ID) {
+		r.delay(msg, job.ID, "duplicate delivery", errors.New("local handler already active"))
+		return
+	}
+	defer r.releaseInflight(job.ID)
 	r.attempt(ctx, msg, job)
 }
 
-// followUp continues processing for this delivery. send_started_at must stay empty
-// until the sender runs, so a filled timestamp with no local send means another
-// attempt owns the job or a previous process died after marking start.
 func (r *Runner) followUp(ctx context.Context, msg ackMessage, job domain.Job) {
 	switch job.Status {
-	case domain.StatusSucceeded, domain.StatusFailed, domain.StatusCanceled:
+	case domain.StatusSucceeded, domain.StatusFailed, domain.StatusCanceled, domain.StatusUnknown:
 		if job.Status == domain.StatusCanceled {
 			r.Stats.CanceledTerminalAcks.Add(1)
 		}
 		r.log.Info("skip terminal duplicate", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
 		_ = msg.Ack()
 	case domain.StatusProcessing:
+		if !r.ownsJob(job) {
+			r.rejectNotOwner(msg, job.ID, "resume processing")
+			return
+		}
+		if r.leaseExpired(job) {
+			r.delay(msg, job.ID, "lease expired", errors.New("processing lease expired"))
+			return
+		}
 		if job.SendStartedAt != nil {
-			r.delay(msg, job.ID, "resume processing", errors.New("send already started on another attempt"))
+			r.delay(msg, job.ID, "send already started", errors.New("cannot resume send on redelivery"))
 			return
 		}
 		if job.SendAttemptID == nil {
 			r.delay(msg, job.ID, "resume processing", errors.New("missing send attempt id"))
 			return
 		}
-		if !r.ownsJob(job) {
-			r.rejectNotOwner(msg, job.ID, "resume processing")
+		if !r.tryInflight(job.ID) {
+			r.delay(msg, job.ID, "duplicate delivery", errors.New("local handler already active"))
 			return
 		}
+		defer r.releaseInflight(job.ID)
 		r.attempt(ctx, msg, job)
+	case domain.StatusQueued:
+		r.delay(msg, job.ID, "stale delivery", errors.New("job queued; wait for recovery publish"))
 	default:
-		r.log.Error("skip unexpected status", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
+		r.log.Info("skip after status change", "job_id", job.ID.String(), "status", job.Status, "worker_id", r.workerID)
 		_ = msg.Ack()
 	}
 }
@@ -174,31 +206,40 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 		return
 	}
 
-	stopProgress := r.keepInProgress(ctx, msg)
-	defer stopProgress()
-
 	attempt := *job.SendAttemptID
 	id := job.ID
 
+	attemptCtx, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+
+	stopProgress := r.keepInProgress(ctx, msg)
+	defer stopProgress()
+
+	stopLease := r.startLeaseHeartbeat(attemptCtx, cancelAttempt, id, attempt)
+	defer stopLease()
+
 	var started time.Time
-	err := retryDB(ctx, r.retryDelays, func() error {
+	err := retryDB(attemptCtx, r.retryDelays, func() error {
 		var markErr error
-		started, markErr = r.store.MarkSendStarted(ctx, id, attempt)
+		started, markErr = r.store.MarkSendStarted(attemptCtx, id, attempt, r.workerID)
 		return markErr
 	})
 	if err != nil {
-		if errors.Is(err, domain.ErrNotProcessing) {
-			r.delay(msg, id, "mark send start", err)
+		if errors.Is(err, domain.ErrLeaseLost) {
+			r.log.Info("mark send lost lease", "job_id", id.String(), "worker_id", r.workerID)
 			return
 		}
-		if ctx.Err() != nil {
+		if attemptCtx.Err() != nil {
 			return
 		}
 		r.delay(msg, id, "mark send start", err)
 		return
 	}
 
-	sendErr := r.sender.Send(ctx, sender.Job{
+	sendCtx, cancelSend := context.WithTimeout(attemptCtx, r.sendTimeout)
+	defer cancelSend()
+
+	sendErr := r.sender.Send(sendCtx, sender.Job{
 		ID:            job.ID,
 		RecipientID:   job.RecipientID,
 		Payload:       job.Payload,
@@ -206,21 +247,63 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 		SendStartedAt: started,
 	})
 	if sendErr != nil {
-		if ctx.Err() != nil {
-			r.log.Info("send interrupted by shutdown", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
+		if attemptCtx.Err() != nil {
+			r.log.Info("send interrupted by shutdown or lease loss", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
 			return
 		}
-		status := domain.StatusFailed
+		if errors.Is(sendErr, context.DeadlineExceeded) && sendCtx.Err() != nil {
+			text := domain.LastErrorSendTimeout
+			r.finishUntilDone(attemptCtx, msg, id, attempt, domain.StatusUnknown, &text)
+			return
+		}
+		if errors.Is(sendErr, sender.ErrSimulatedSend) {
+			text := sendErr.Error()
+			r.finishUntilDone(attemptCtx, msg, id, attempt, domain.StatusFailed, &text)
+			return
+		}
 		text := sendErr.Error()
-		lastError := &text
 		r.log.Error("sender failed", "job_id", id.String(), "worker_id", r.workerID, "err", sendErr)
-		r.finishUntilDone(ctx, msg, id, status, lastError)
+		r.finishUntilDone(attemptCtx, msg, id, attempt, domain.StatusFailed, &text)
 		return
 	}
-	r.finishUntilDone(ctx, msg, id, domain.StatusSucceeded, nil)
+	r.finishUntilDone(attemptCtx, msg, id, attempt, domain.StatusSucceeded, nil)
 }
 
-// keepInProgress sends JetStream in-progress acks until stop is called or ctx ends.
+func (r *Runner) startLeaseHeartbeat(ctx context.Context, cancelAttempt context.CancelFunc, id, attempt uuid.UUID) func() {
+	interval := r.leaseRenewEvery
+	if interval <= 0 {
+		interval = DefaultLeaseRenewInterval
+	}
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := retryDB(ctx, r.retryDelays, func() error {
+					return r.store.RenewLease(ctx, id, attempt, r.workerID, r.leaseDuration)
+				})
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, domain.ErrLeaseLost) || ctx.Err() != nil {
+					cancelAttempt()
+					return
+				}
+				r.log.Error("lease renew", "job_id", id.String(), "worker_id", r.workerID, "err", err)
+				cancelAttempt()
+				return
+			}
+		}
+	}()
+	return func() { close(stop) }
+}
+
 func (r *Runner) keepInProgress(ctx context.Context, msg ackMessage) func() {
 	interval := r.progressInterval
 	if interval <= 0 {
@@ -250,19 +333,17 @@ func (r *Runner) keepInProgress(ctx context.Context, msg ackMessage) func() {
 	return func() { close(stop) }
 }
 
-// finishUntilDone keeps the JetStream message unacked and retries Finish with
-// backoff until the database accepts the result or the work context ends.
-func (r *Runner) finishUntilDone(ctx context.Context, msg ackMessage, id uuid.UUID, status domain.Status, lastError *string) {
+func (r *Runner) finishUntilDone(ctx context.Context, msg ackMessage, id, attempt uuid.UUID, status domain.Status, lastError *string) {
 	for {
 		err := retryDB(ctx, r.retryDelays, func() error {
-			return r.store.Finish(ctx, id, status, lastError)
+			return r.store.FinishAttempt(ctx, id, attempt, r.workerID, status, lastError)
 		})
 		if err == nil {
 			_ = msg.Ack()
 			return
 		}
-		if errors.Is(err, domain.ErrNotProcessing) {
-			r.log.Info("result already recorded", "job_id", id.String(), "worker_id", r.workerID)
+		if errors.Is(err, domain.ErrLeaseLost) || errors.Is(err, domain.ErrNotProcessing) {
+			r.log.Info("result already recorded or lease lost", "job_id", id.String(), "worker_id", r.workerID)
 			_ = msg.Ack()
 			return
 		}
@@ -274,6 +355,22 @@ func (r *Runner) finishUntilDone(ctx context.Context, msg ackMessage, id uuid.UU
 			return
 		}
 	}
+}
+
+func (r *Runner) tryInflight(id uuid.UUID) bool {
+	_, loaded := r.inflight.LoadOrStore(id, struct{}{})
+	return !loaded
+}
+
+func (r *Runner) releaseInflight(id uuid.UUID) {
+	r.inflight.Delete(id)
+}
+
+func (r *Runner) leaseExpired(job domain.Job) bool {
+	if job.LeaseUntil == nil {
+		return true
+	}
+	return !job.LeaseUntil.After(time.Now().UTC())
 }
 
 func wait(ctx context.Context, delay time.Duration) bool {
@@ -302,7 +399,6 @@ func (r *Runner) ownsJob(job domain.Job) bool {
 	return job.WorkerID != nil && *job.WorkerID == r.workerID
 }
 
-// SetDelays overrides retry pacing. Tests use shorter waits than production defaults.
 func (r *Runner) SetDelays(nakDelay time.Duration, dbRetries []time.Duration) {
 	if nakDelay > 0 {
 		r.nakDelay = nakDelay
@@ -312,7 +408,6 @@ func (r *Runner) SetDelays(nakDelay time.Duration, dbRetries []time.Duration) {
 	}
 }
 
-// SetProgressInterval overrides how often in-progress acks are sent.
 func (r *Runner) SetProgressInterval(interval time.Duration) {
 	r.progressInterval = interval
 }

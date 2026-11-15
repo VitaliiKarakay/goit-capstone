@@ -53,6 +53,9 @@ services:
       SCHEDULER_BATCH: "100"
       OUTBOX_INTERVAL: 500ms
       OUTBOX_BATCH: "50"
+      RECOVERY_INTERVAL: 5s
+      RECOVERY_BATCH: "50"
+      MAX_CLAIM_ATTEMPTS: "5"
       LOG_LEVEL: info
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"
@@ -75,6 +78,9 @@ services:
       METRICS_ADDR: 0.0.0.0:9091
       MOCK_SEND_DELAY: ${MOCK_SEND_DELAY:-}
       MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-}
+      WORKER_LEASE_DURATION: 45s
+      WORKER_LEASE_RENEW_INTERVAL: 10s
+      WORKER_SEND_TIMEOUT: 90s
     expose:
       - "9091"
     depends_on:
