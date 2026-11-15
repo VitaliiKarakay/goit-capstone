@@ -318,11 +318,49 @@ func (r *Runner) startLeaseHeartbeat(ctx context.Context, cancelAttempt context.
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		resetLeaseTimer := func(t **time.Timer, until time.Time) {
+			if !until.After(time.Now().UTC()) {
+				return
+			}
+			d := time.Until(until)
+			if *t == nil {
+				*t = time.NewTimer(d)
+				return
+			}
+			if !(*t).Stop() {
+				select {
+				case <-(*t).C:
+				default:
+				}
+			}
+			(*t).Reset(d)
+		}
+
+		if !confirmedUntil.After(time.Now().UTC()) {
+			cancelAttempt()
+			return
+		}
+		var leaseTimer *time.Timer
+		resetLeaseTimer(&leaseTimer, confirmedUntil)
+		defer func() {
+			if leaseTimer != nil {
+				leaseTimer.Stop()
+			}
+		}()
+
 		for {
+			var leaseC <-chan time.Time
+			if leaseTimer != nil {
+				leaseC = leaseTimer.C
+			}
 			select {
 			case <-stop:
 				return
 			case <-ctx.Done():
+				return
+			case <-leaseC:
+				cancelAttempt()
 				return
 			case <-ticker.C:
 				confirmedMu.Lock()
@@ -337,6 +375,7 @@ func (r *Runner) startLeaseHeartbeat(ctx context.Context, cancelAttempt context.
 					confirmedMu.Lock()
 					confirmedUntil = renewed
 					confirmedMu.Unlock()
+					resetLeaseTimer(&leaseTimer, renewed)
 					continue
 				}
 				if errors.Is(err, domain.ErrLeaseLost) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || ctx.Err() != nil {

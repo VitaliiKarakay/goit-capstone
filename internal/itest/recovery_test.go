@@ -172,9 +172,18 @@ func TestConcurrentRecoveryCreatesSingleOutboxRow(t *testing.T) {
 }
 
 func TestLongProcessingRenewsLeaseDuringMarkDelay(t *testing.T) {
+	workerA := "worker-a"
+	only := workerA
+	env.fault.onlyClaimWorker.Store(&only)
+	defer env.fault.onlyClaimWorker.Store(nil)
+
+	a, b := env.runnerBy["worker-a"], env.runnerBy["worker-b"]
+	a.SetLeasePolicy(700*time.Millisecond, 120*time.Millisecond, 30*time.Second)
+	defer a.SetLeasePolicy(worker.DefaultLeaseDuration, worker.DefaultLeaseRenewInterval, worker.DefaultSendTimeout)
+	defer b.SetLeasePolicy(worker.DefaultLeaseDuration, worker.DefaultLeaseRenewInterval, worker.DefaultSendTimeout)
+
 	env.fault.markSleep.Store(int64(2 * time.Second))
 	defer env.fault.markSleep.Store(0)
-	env.runnerBy["worker-a"].SetLeasePolicy(700*time.Millisecond, 120*time.Millisecond, 30*time.Second)
 
 	at := time.Now().UTC().Add(-time.Minute)
 	body := jobBody("renew-mark-"+uuid.NewString(), "renew-user", at, "body")
@@ -183,6 +192,22 @@ func TestLongProcessingRenewsLeaseDuringMarkDelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := uuid.MustParse(id)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var owner string
+		if err := env.db.QueryRow(context.Background(), `SELECT coalesce(worker_id,'') FROM jobs WHERE id=$1`, jobID).Scan(&owner); err != nil {
+			t.Fatal(err)
+		}
+		if owner == workerA {
+			break
+		}
+		if owner != "" && owner != workerA {
+			t.Fatalf("unexpected claimant %q", owner)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	env.waitStatus(t, id, "succeeded", 30*time.Second)
 	if env.rec.count(jobID) != 1 {
 		t.Fatalf("send calls=%d", env.rec.count(jobID))
@@ -191,6 +216,11 @@ func TestLongProcessingRenewsLeaseDuringMarkDelay(t *testing.T) {
 
 func TestStaleFinishRejectedAfterRecoveryClaim(t *testing.T) {
 	ctx := context.Background()
+	workerA := "worker-a"
+	only := workerA
+	env.fault.onlyClaimWorker.Store(&only)
+	defer env.fault.onlyClaimWorker.Store(nil)
+
 	id, jobID := seedExpiredProcessing(t, "stale-finish", "body", false, 1)
 	var oldAttempt uuid.UUID
 	if err := env.db.QueryRow(ctx, `SELECT send_attempt_id FROM jobs WHERE id=$1`, jobID).Scan(&oldAttempt); err != nil {
@@ -199,16 +229,51 @@ func TestStaleFinishRejectedAfterRecoveryClaim(t *testing.T) {
 	if _, err := env.direct.RecoverExpiredLeases(ctx, 10, worker.DefaultMaxClaimAttempts); err != nil {
 		t.Fatal(err)
 	}
-	env.waitStatus(t, id, "succeeded", 30*time.Second)
+
+	env.fault.markSleep.Store(int64(4 * time.Second))
+	defer env.fault.markSleep.Store(0)
+
+	deadline := time.Now().Add(20 * time.Second)
+	var newAttempt uuid.UUID
+	var activeWorker string
+	for time.Now().Before(deadline) {
+		var status string
+		var attempt uuid.UUID
+		if err := env.db.QueryRow(ctx, `
+			SELECT send_attempt_id, coalesce(worker_id,''), status
+			FROM jobs WHERE id=$1`, jobID).Scan(&attempt, &activeWorker, &status); err != nil {
+			t.Fatal(err)
+		}
+		if status == "processing" && activeWorker == workerA && attempt != oldAttempt {
+			newAttempt = attempt
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if newAttempt == uuid.Nil || newAttempt == oldAttempt {
+		t.Fatal("expected new attempt while processing on worker-a")
+	}
+
 	text := "stale"
-	err := env.direct.FinishAttempt(ctx, jobID, oldAttempt, "ghost", domain.StatusSucceeded, &text)
+	err := env.direct.FinishAttempt(ctx, jobID, oldAttempt, activeWorker, domain.StatusSucceeded, &text)
 	if err == nil {
 		t.Fatal("expected stale finish to fail")
 	}
-	got := env.get(t, id)
-	if got["status"] != string(domain.StatusSucceeded) {
-		t.Fatalf("status=%v", got["status"])
+	var statusAfter string
+	var attemptAfter uuid.UUID
+	if err := env.db.QueryRow(ctx, `
+		SELECT status, send_attempt_id FROM jobs WHERE id=$1`, jobID).Scan(&statusAfter, &attemptAfter); err != nil {
+		t.Fatal(err)
 	}
+	if statusAfter != "processing" {
+		t.Fatalf("status=%s want processing", statusAfter)
+	}
+	if attemptAfter != newAttempt {
+		t.Fatalf("attempt changed from %s to %s", newAttempt, attemptAfter)
+	}
+
+	env.fault.markSleep.Store(0)
+	env.waitStatus(t, id, "succeeded", 30*time.Second)
 }
 
 func TestUnknownRedeliveryDoesNotSend(t *testing.T) {

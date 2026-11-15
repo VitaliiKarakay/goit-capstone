@@ -36,6 +36,34 @@ func TestDeliveryBudgetSurvivesAShortOutage(t *testing.T) {
 	}
 }
 
+func TestLeaseExpiresBeforeNextRenewTickCancelsAttempt(t *testing.T) {
+	job := sampleJob()
+	leaseEnd := time.Now().UTC().Add(350 * time.Millisecond)
+	job.LeaseUntil = &leaseEnd
+	store := &fakeStore{found: true, claimed: true, job: job}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.SetLeasePolicy(time.Minute, 2*time.Second, time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		runner.handle(context.Background(), msg.data, msg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler hung")
+	}
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
+	}
+	if store.finished != "" {
+		t.Fatalf("finished=%s", store.finished)
+	}
+}
+
 func TestRenewHungRequestAbortsWithinLeaseBudget(t *testing.T) {
 	job := sampleJob()
 	leaseEnd := time.Now().UTC().Add(400 * time.Millisecond)

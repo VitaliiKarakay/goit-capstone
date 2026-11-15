@@ -805,6 +805,7 @@ type faultStore struct {
 	loseMarkResponse atomic.Bool
 	markSleep        atomic.Int64
 	pauseClaim       atomic.Bool
+	onlyClaimWorker  atomic.Pointer[string]
 }
 
 func (s *faultStore) Claim(ctx context.Context, id uuid.UUID, workerID string, lease time.Duration) (domain.Job, bool, bool, error) {
@@ -814,6 +815,13 @@ func (s *faultStore) Claim(ctx context.Context, id uuid.UUID, workerID string, l
 			return domain.Job{}, false, false, ctx.Err()
 		case <-time.After(25 * time.Millisecond):
 		}
+	}
+	if only := s.onlyClaimWorker.Load(); only != nil && workerID != *only {
+		job, err := s.Store.GetJob(ctx, id)
+		if err != nil {
+			return domain.Job{}, false, false, err
+		}
+		return job, true, false, nil
 	}
 	return s.Store.Claim(ctx, id, workerID, lease)
 }

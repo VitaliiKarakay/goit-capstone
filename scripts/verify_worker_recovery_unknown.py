@@ -13,6 +13,9 @@ import json
 import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from demo_preflight import assert_quiet_standalone_jobs
 import time
 import urllib.error
 import urllib.request
@@ -66,6 +69,8 @@ def main():
     workers = worker_container_ids()
     if len(workers) != 1:
         fail(f"expected one worker, found {len(workers)}")
+
+    assert_quiet_standalone_jobs(API, request, fail)
 
     scheduled = (datetime.now(timezone.utc) - timedelta(seconds=2)).strftime(
         "%Y-%m-%dT%H:%M:%S.%fZ"
