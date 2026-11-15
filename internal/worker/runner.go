@@ -18,7 +18,7 @@ import (
 
 type Store interface {
 	Claim(ctx context.Context, id uuid.UUID, workerID string, lease time.Duration) (domain.Job, bool, bool, error)
-	RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) error
+	RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) (time.Time, error)
 	MarkSendStarted(ctx context.Context, id, attempt uuid.UUID, workerID string) (time.Time, error)
 	FinishAttempt(ctx context.Context, id, attempt uuid.UUID, workerID string, status domain.Status, lastError *string) error
 }
@@ -30,32 +30,34 @@ type Stats struct {
 }
 
 type Runner struct {
-	log              *slog.Logger
-	store            Store
-	sender           sender.Sender
-	workerID         string
-	retryDelays      []time.Duration
-	nakDelay         time.Duration
-	progressInterval time.Duration
-	leaseDuration    time.Duration
-	leaseRenewEvery  time.Duration
-	sendTimeout      time.Duration
-	inflight         sync.Map
-	Stats            Stats
+	log                      *slog.Logger
+	store                    Store
+	sender                   sender.Sender
+	workerID                 string
+	retryDelays              []time.Duration
+	nakDelay                 time.Duration
+	progressInterval         time.Duration
+	leaseDuration            time.Duration
+	leaseRenewEvery          time.Duration
+	leaseRenewRequestTimeout time.Duration
+	sendTimeout              time.Duration
+	inflight                 sync.Map
+	Stats                    Stats
 }
 
 func New(log *slog.Logger, store Store, send sender.Sender, workerID string) *Runner {
 	return &Runner{
-		log:              log,
-		store:            store,
-		sender:           send,
-		workerID:         workerID,
-		retryDelays:      DBRetryDelays,
-		nakDelay:         NakDelay,
-		progressInterval: AckProgressInterval,
-		leaseDuration:    DefaultLeaseDuration,
-		leaseRenewEvery:  DefaultLeaseRenewInterval,
-		sendTimeout:      DefaultSendTimeout,
+		log:                      log,
+		store:                    store,
+		sender:                   send,
+		workerID:                 workerID,
+		retryDelays:              DBRetryDelays,
+		nakDelay:                 NakDelay,
+		progressInterval:         AckProgressInterval,
+		leaseDuration:            DefaultLeaseDuration,
+		leaseRenewEvery:          DefaultLeaseRenewInterval,
+		leaseRenewRequestTimeout: DefaultLeaseRenewRequestTimeout,
+		sendTimeout:              DefaultSendTimeout,
 	}
 }
 
@@ -147,7 +149,7 @@ func (r *Runner) handle(ctx context.Context, data []byte, msg ackMessage) {
 		r.followUp(ctx, msg, job)
 		return
 	}
-	maybePauseAfterClaim()
+	maybePauseAfterClaim(ctx)
 	if !r.tryInflight(job.ID) {
 		r.delay(msg, job.ID, "duplicate delivery", errors.New("local handler already active"))
 		return
@@ -215,7 +217,8 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 	stopProgress := r.keepInProgress(ctx, msg)
 	defer stopProgress()
 
-	stopLease := r.startLeaseHeartbeat(attemptCtx, cancelAttempt, id, attempt)
+	confirmedLease := r.confirmedLeaseUntil(job)
+	stopLease := r.startLeaseHeartbeat(attemptCtx, cancelAttempt, id, attempt, confirmedLease)
 	defer stopLease()
 
 	var started time.Time
@@ -269,12 +272,49 @@ func (r *Runner) attempt(ctx context.Context, msg ackMessage, job domain.Job) {
 	r.finishUntilDone(attemptCtx, msg, id, attempt, domain.StatusSucceeded, nil)
 }
 
-func (r *Runner) startLeaseHeartbeat(ctx context.Context, cancelAttempt context.CancelFunc, id, attempt uuid.UUID) func() {
+func (r *Runner) confirmedLeaseUntil(job domain.Job) time.Time {
+	if job.LeaseUntil != nil {
+		return job.LeaseUntil.UTC()
+	}
+	return time.Now().UTC().Add(r.leaseDuration)
+}
+
+func (r *Runner) renewRequestTimeout() time.Duration {
+	if r.leaseRenewRequestTimeout > 0 {
+		return r.leaseRenewRequestTimeout
+	}
+	return DefaultLeaseRenewRequestTimeout
+}
+
+func (r *Runner) tryRenewLease(ctx context.Context, id, attempt uuid.UUID, confirmedUntil time.Time) (time.Time, error) {
+	if !confirmedUntil.After(time.Now().UTC()) {
+		return time.Time{}, domain.ErrLeaseLost
+	}
+	budgetCtx, cancelBudget := context.WithDeadline(ctx, confirmedUntil)
+	defer cancelBudget()
+
+	var renewed time.Time
+	err := retryDB(budgetCtx, r.retryDelays, func() error {
+		reqCtx, cancelReq := context.WithTimeout(budgetCtx, r.renewRequestTimeout())
+		defer cancelReq()
+		until, err := r.store.RenewLease(reqCtx, id, attempt, r.workerID, r.leaseDuration)
+		if err != nil {
+			return err
+		}
+		renewed = until.UTC()
+		return nil
+	})
+	return renewed, err
+}
+
+func (r *Runner) startLeaseHeartbeat(ctx context.Context, cancelAttempt context.CancelFunc, id, attempt uuid.UUID, initialConfirmed time.Time) func() {
 	interval := r.leaseRenewEvery
 	if interval <= 0 {
 		interval = DefaultLeaseRenewInterval
 	}
 	stop := make(chan struct{})
+	var confirmedMu sync.Mutex
+	confirmedUntil := initialConfirmed
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -285,13 +325,21 @@ func (r *Runner) startLeaseHeartbeat(ctx context.Context, cancelAttempt context.
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				err := retryDB(ctx, r.retryDelays, func() error {
-					return r.store.RenewLease(ctx, id, attempt, r.workerID, r.leaseDuration)
-				})
+				confirmedMu.Lock()
+				until := confirmedUntil
+				confirmedMu.Unlock()
+				if !until.After(time.Now().UTC()) {
+					cancelAttempt()
+					return
+				}
+				renewed, err := r.tryRenewLease(ctx, id, attempt, until)
 				if err == nil {
+					confirmedMu.Lock()
+					confirmedUntil = renewed
+					confirmedMu.Unlock()
 					continue
 				}
-				if errors.Is(err, domain.ErrLeaseLost) || ctx.Err() != nil {
+				if errors.Is(err, domain.ErrLeaseLost) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
 					cancelAttempt()
 					return
 				}

@@ -230,20 +230,22 @@ func (s *Store) Claim(ctx context.Context, id uuid.UUID, workerID string, lease 
 	return job, true, false, nil
 }
 
-func (s *Store) RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) error {
-	tag, err := s.pool.Exec(ctx, `
+func (s *Store) RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) (time.Time, error) {
+	var until time.Time
+	err := s.pool.QueryRow(ctx, `
 		UPDATE jobs
 		SET lease_until = clock_timestamp() + $4::interval, updated_at = clock_timestamp()
 		WHERE id = $1::uuid AND worker_id = $2 AND send_attempt_id = $3::uuid
-		  AND status = 'processing' AND lease_until > clock_timestamp()`,
-		id.String(), workerID, attempt.String(), lease.String())
+		  AND status = 'processing' AND lease_until > clock_timestamp()
+		RETURNING lease_until`,
+		id.String(), workerID, attempt.String(), lease.String()).Scan(&until)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, domain.ErrLeaseLost
+	}
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrLeaseLost
-	}
-	return nil
+	return until, nil
 }
 
 func (s *Store) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID, workerID string) (time.Time, error) {

@@ -117,6 +117,10 @@ func LoadWorker() (Worker, error) {
 	if cfg.SendTimeout, err = duration("WORKER_SEND_TIMEOUT", cfg.SendTimeout); err != nil {
 		return Worker{}, err
 	}
+	half := cfg.LeaseDuration / 2
+	if cfg.LeaseRenewEvery >= half {
+		return Worker{}, fmt.Errorf("WORKER_LEASE_RENEW_INTERVAL must be less than half of WORKER_LEASE_DURATION (%s)", half)
+	}
 	return cfg, nil
 }
 

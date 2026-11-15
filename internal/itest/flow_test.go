@@ -818,9 +818,9 @@ func (s *faultStore) Claim(ctx context.Context, id uuid.UUID, workerID string, l
 	return s.Store.Claim(ctx, id, workerID, lease)
 }
 
-func (s *faultStore) RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) error {
+func (s *faultStore) RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) (time.Time, error) {
 	if s.failRenew.Load() {
-		return dbDown()
+		return time.Time{}, dbDown()
 	}
 	return s.Store.RenewLease(ctx, id, attempt, workerID, lease)
 }
@@ -856,11 +856,16 @@ func dbDown() error {
 type recordingSender struct {
 	workerID string
 	rec      *recorder
+	delay    time.Duration
 }
 
 func (s recordingSender) Send(_ context.Context, job sender.Job) error {
 	s.rec.add(job.ID, s.workerID)
-	time.Sleep(30 * time.Millisecond)
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	} else {
+		time.Sleep(30 * time.Millisecond)
+	}
 	return nil
 }
 

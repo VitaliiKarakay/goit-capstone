@@ -61,7 +61,8 @@ export function CampaignListPage() {
                 <td className="counts">
                   <StatusBadge status="succeeded" /> {c.counts.succeeded ?? 0}{" "}
                   <StatusBadge status="failed" /> {c.counts.failed ?? 0}{" "}
-                  <StatusBadge status="canceled" /> {c.counts.canceled ?? 0}
+                  <StatusBadge status="canceled" /> {c.counts.canceled ?? 0}{" "}
+                  <StatusBadge status="unknown" /> {c.counts.unknown ?? 0}
                 </td>
                 <td>
                   <Link to={`/campaigns/${c.campaign_id}`}>Open</Link>

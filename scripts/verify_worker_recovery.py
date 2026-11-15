@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Crash demo: worker freezes after Claim (demorecovery build), then SIGKILL.
+"""Crash demo: demorecovery worker pauses after Claim, SIGKILL, requeue, then normal worker completes job.
 
-Requires:
-  docker compose -f compose.yaml -f compose.demorecovery.yaml up -d --scale worker=1 worker
+Phase 1 (demorecovery):
+  docker compose -f compose.yaml -f compose.demorecovery.yaml up -d --scale worker=1 worker controller
 
-Exit 0 when the job returns to queued after controller lease recovery.
+Phase 2 (this script): queued → recreate standard worker → succeeded
+
+Exit 0 when the job reaches succeeded after recovery requeue.
 """
 
 import json
@@ -18,9 +20,10 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 API = os.environ.get("API", "http://127.0.0.1:8080")
-COMPOSE_FILES = os.environ.get(
+DEMO_COMPOSE = os.environ.get(
     "COMPOSE_FILE", "compose.yaml:compose.demorecovery.yaml"
 ).split(":")
+BASE_COMPOSE = ["compose.yaml"]
 
 
 def fail(message):
@@ -43,16 +46,16 @@ def request(method, path, body=None):
         return err.code, json.loads(err.read() or b"{}")
 
 
-def compose_cmd(*args):
+def compose_cmd(files, *args):
     cmd = ["docker", "compose"]
-    for f in COMPOSE_FILES:
+    for f in files:
         cmd.extend(["-f", f])
     cmd.extend(list(args))
     return cmd
 
 
-def worker_container_ids():
-    out = subprocess.check_output(compose_cmd("ps", "-q", "worker"), text=True).strip()
+def worker_container_ids(files):
+    out = subprocess.check_output(compose_cmd(files, "ps", "-q", "worker"), text=True).strip()
     if not out:
         fail("no worker containers running")
     return [line for line in out.splitlines() if line]
@@ -63,7 +66,7 @@ def main():
     if status != 200 or health.get("status") != "ok":
         fail(f"health check failed: {status} {health}")
 
-    workers = worker_container_ids()
+    workers = worker_container_ids(DEMO_COMPOSE)
     if len(workers) != 1:
         fail(f"expected one worker, found {len(workers)} (use --scale worker=1)")
 
@@ -99,10 +102,37 @@ def main():
     while time.time() < recover_deadline:
         _, job = request("GET", f"/jobs/{job_id}")
         if job.get("status") == "queued":
-            print("job requeued after SIGKILL recovery demo", job_id)
-            return
+            break
         time.sleep(0.5)
-    fail(f"job did not return to queued: last status={job.get('status')}")
+    else:
+        fail(f"job did not return to queued: last status={job.get('status')}")
+
+    print("job requeued after SIGKILL recovery demo", job_id)
+
+    subprocess.run(
+        compose_cmd(
+            BASE_COMPOSE,
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            "--scale",
+            "worker=1",
+            "worker",
+        ),
+        check=True,
+    )
+
+    done_deadline = time.time() + 90
+    while time.time() < done_deadline:
+        _, job = request("GET", f"/jobs/{job_id}")
+        if job.get("status") == "succeeded":
+            print("job succeeded after normal worker takeover", job_id)
+            return
+        if job.get("status") in ("failed", "unknown"):
+            fail(f"unexpected terminal status after requeue: {job}")
+        time.sleep(0.5)
+    fail(f"job did not succeed: last status={job.get('status')}")
 
 
 if __name__ == "__main__":

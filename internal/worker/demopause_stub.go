@@ -2,4 +2,6 @@
 
 package worker
 
-func maybePauseAfterClaim() {}
+import "context"
+
+func maybePauseAfterClaim(context.Context) {}

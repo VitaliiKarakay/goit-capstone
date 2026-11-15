@@ -268,7 +268,15 @@ docker compose -f compose.yaml -f compose.demorecovery.yaml up --build -d --scal
 API=http://127.0.0.1:18080 python3 scripts/verify_worker_recovery.py
 ```
 
-The worker blocks after `Claim` when `RECOVERY_DEMO_PAUSE_AFTER_CLAIM=1`; the script kills the container once the job is `processing` without `send_started_at`, then expects recovery to return the job to **`queued`**.
+The worker blocks after `Claim` when `RECOVERY_DEMO_PAUSE_AFTER_CLAIM=1`; the script kills the container once the job is `processing` without `send_started_at`, recreates a **standard** worker, then expects **`succeeded`**.
+
+For **`unknown`**, use a normal worker with a long mock send and SIGKILL after `send_started_at`:
+
+```bash
+export API_PORT=18080 MOCK_SEND_DELAY=45s
+docker compose up -d --scale worker=1 worker controller
+API=http://127.0.0.1:18080 python3 scripts/verify_worker_recovery_unknown.py
+```
 
 ## Tests
 
