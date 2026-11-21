@@ -12,6 +12,12 @@ const (
 	// AckProgressInterval resets AckWait while a message is being processed.
 	// It must stay below AckWait so the broker does not redeliver in-flight work.
 	AckProgressInterval = 10 * time.Second
+
+	DefaultLeaseDuration            = 45 * time.Second
+	DefaultLeaseRenewInterval       = 10 * time.Second
+	DefaultLeaseRenewRequestTimeout = 3 * time.Second
+	DefaultSendTimeout              = 90 * time.Second
+	DefaultMaxClaimAttempts         = 5
 )
 
 // DBRetryDelays are the waits between claim attempts inside a single delivery.

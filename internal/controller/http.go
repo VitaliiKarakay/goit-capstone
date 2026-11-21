@@ -426,6 +426,7 @@ func campaignView(c domain.CampaignSummary) campaignResponse {
 		string(domain.StatusSucceeded):  c.Counts[domain.StatusSucceeded],
 		string(domain.StatusFailed):     c.Counts[domain.StatusFailed],
 		string(domain.StatusCanceled):   c.Counts[domain.StatusCanceled],
+		string(domain.StatusUnknown):    c.Counts[domain.StatusUnknown],
 	}
 	resp := campaignResponse{
 		CampaignID:  c.ID.String(),

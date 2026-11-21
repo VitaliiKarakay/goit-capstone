@@ -86,6 +86,9 @@ td {
 .st-canceled {
   background: #e2e3e5;
 }
+.st-unknown {
+  background: #fff3cd;
+}
 .st-failed {
   background: #f8d7da;
 }

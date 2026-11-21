@@ -47,7 +47,7 @@ func ParseStatusFilter(raw string) (Status, []FieldError) {
 		return "", nil
 	}
 	switch Status(raw) {
-	case StatusScheduled, StatusQueued, StatusProcessing, StatusSucceeded, StatusFailed, StatusCanceled:
+	case StatusScheduled, StatusQueued, StatusProcessing, StatusSucceeded, StatusFailed, StatusCanceled, StatusUnknown:
 		return Status(raw), nil
 	default:
 		return "", []FieldError{{Field: "status", Code: "invalid"}}

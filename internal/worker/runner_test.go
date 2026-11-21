@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,162 @@ func TestDeliveryBudgetSurvivesAShortOutage(t *testing.T) {
 	}
 	if AckWait <= inProcess {
 		t.Fatal("ack wait must outlast the in-process database retries")
+	}
+}
+
+func TestLeaseExpiresBeforeNextRenewTickCancelsAttempt(t *testing.T) {
+	job := sampleJob()
+	leaseEnd := time.Now().UTC().Add(350 * time.Millisecond)
+	job.LeaseUntil = &leaseEnd
+	store := &fakeStore{found: true, claimed: true, job: job}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.SetLeasePolicy(time.Minute, 2*time.Second, time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		runner.handle(context.Background(), msg.data, msg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler hung")
+	}
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
+	}
+	if store.finished != "" {
+		t.Fatalf("finished=%s", store.finished)
+	}
+}
+
+func TestRenewHungRequestAbortsWithinLeaseBudget(t *testing.T) {
+	job := sampleJob()
+	leaseEnd := time.Now().UTC().Add(400 * time.Millisecond)
+	job.LeaseUntil = &leaseEnd
+	store := &fakeStore{found: true, claimed: true, job: job}
+	store.renewHang.Store(true)
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.SetLeasePolicy(400*time.Millisecond, 50*time.Millisecond, time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		runner.handle(context.Background(), msg.data, msg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler hung")
+	}
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
+	}
+	if store.finished != "" {
+		t.Fatalf("finished=%s", store.finished)
+	}
+	if store.renewCalls.Load() == 0 {
+		t.Fatal("expected at least one renew attempt")
+	}
+}
+
+func TestMultipleRenewalsDuringLongSend(t *testing.T) {
+	job := sampleJob()
+	leaseEnd := time.Now().UTC().Add(2 * time.Second)
+	job.LeaseUntil = &leaseEnd
+	store := &fakeStore{found: true, claimed: true, job: job}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.SetLeasePolicy(600*time.Millisecond, 80*time.Millisecond, time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go runner.handle(ctx, msg.data, msg)
+	<-ctx.Done()
+	time.Sleep(100 * time.Millisecond)
+	if store.renewCalls.Load() < 2 {
+		t.Fatalf("renew calls=%d want >=2", store.renewCalls.Load())
+	}
+}
+
+func TestRenewLeaseLossStopsAttemptWithoutFinish(t *testing.T) {
+	job := sampleJob()
+	store := &fakeStore{found: true, claimed: true, job: job, renewErr: domain.ErrLeaseLost}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.SetLeasePolicy(time.Minute, 20*time.Millisecond, time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		runner.handle(context.Background(), msg.data, msg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler hung")
+	}
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
+	}
+	if store.finished != "" {
+		t.Fatalf("finished=%s", store.finished)
+	}
+}
+
+func TestDuplicateDeliveryDoesNotDoubleSend(t *testing.T) {
+	job := sampleJob()
+	store := &fakeStore{found: true, claimed: true, job: job}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runner.handle(ctx, msg.data, msg)
+		}()
+	}
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	wg.Wait()
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
+	}
+}
+
+func TestSendTimeoutMarksUnknown(t *testing.T) {
+	job := sampleJob()
+	leaseEnd := time.Now().UTC().Add(time.Minute)
+	job.LeaseUntil = &leaseEnd
+	store := &fakeStore{found: true, claimed: true, job: job}
+	send := &blockingSender{}
+	msg := &fakeMsg{data: []byte(job.ID.String())}
+	runner := testRunner(store, send)
+	runner.SetLeasePolicy(time.Minute, time.Minute, 80*time.Millisecond)
+
+	runner.handle(context.Background(), msg.data, msg)
+	if send.calls != 1 {
+		t.Fatalf("send calls=%d", send.calls)
+	}
+	if store.finished != domain.StatusUnknown {
+		t.Fatalf("finished=%s", store.finished)
+	}
+	if store.last == nil || *store.last != domain.LastErrorSendTimeout {
+		t.Fatalf("last=%v", store.last)
+	}
+	if msg.acks != 1 {
+		t.Fatalf("acks=%d", msg.acks)
 	}
 }
 
@@ -235,7 +393,7 @@ func TestHandleDelaysWhenDatabaseIsDown(t *testing.T) {
 }
 
 func testRunner(store Store, send sender.Sender) *Runner {
-	return &Runner{
+	r := &Runner{
 		log:         slog.New(slog.DiscardHandler),
 		store:       store,
 		sender:      send,
@@ -243,11 +401,14 @@ func testRunner(store Store, send sender.Sender) *Runner {
 		retryDelays: DBRetryDelays,
 		nakDelay:    NakDelay,
 	}
+	r.SetLeasePolicy(DefaultLeaseDuration, DefaultLeaseRenewInterval, DefaultSendTimeout)
+	return r
 }
 
 func sampleJob() domain.Job {
 	attempt := uuid.New()
 	owner := "worker-test"
+	lease := time.Now().UTC().Add(time.Minute)
 	return domain.Job{
 		ID:            uuid.New(),
 		RecipientID:   "user-1",
@@ -255,6 +416,7 @@ func sampleJob() domain.Job {
 		Payload:       []byte(`{"to":"a","subject":"s","body":"b"}`),
 		SendAttemptID: &attempt,
 		WorkerID:      &owner,
+		LeaseUntil:    &lease,
 	}
 }
 
@@ -265,6 +427,7 @@ func dialErr() error {
 type fakeStore struct {
 	claimErr        error
 	markErr         error
+	renewErr        error
 	spuriousMarkErr bool
 	finishFails     int
 	finishCalls     int
@@ -274,16 +437,37 @@ type fakeStore struct {
 	marked          bool
 	finished        domain.Status
 	last            *string
+	renewHang       atomic.Bool
+	renewedLease    time.Time
+	renewCalls      atomic.Int32
 }
 
-func (f *fakeStore) Claim(context.Context, uuid.UUID, string) (domain.Job, bool, bool, error) {
+func (f *fakeStore) RenewLease(ctx context.Context, _ uuid.UUID, _ uuid.UUID, _ string, lease time.Duration) (time.Time, error) {
+	f.renewCalls.Add(1)
+	if f.renewHang.Load() {
+		select {
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		case <-time.After(24 * time.Hour):
+			return time.Time{}, context.DeadlineExceeded
+		}
+	}
+	if f.renewErr != nil {
+		return time.Time{}, f.renewErr
+	}
+	until := time.Now().UTC().Add(lease)
+	f.renewedLease = until
+	return until, nil
+}
+
+func (f *fakeStore) Claim(context.Context, uuid.UUID, string, time.Duration) (domain.Job, bool, bool, error) {
 	if f.claimErr != nil {
 		return domain.Job{}, false, false, f.claimErr
 	}
 	return f.job, f.found, f.claimed, nil
 }
 
-func (f *fakeStore) MarkSendStarted(_ context.Context, id, attempt uuid.UUID) (time.Time, error) {
+func (f *fakeStore) MarkSendStarted(_ context.Context, id, attempt uuid.UUID, _ string) (time.Time, error) {
 	if f.job.SendAttemptID == nil || attempt != *f.job.SendAttemptID {
 		return time.Time{}, domain.ErrNotProcessing
 	}
@@ -301,7 +485,7 @@ func (f *fakeStore) MarkSendStarted(_ context.Context, id, attempt uuid.UUID) (t
 	return time.Now().UTC(), nil
 }
 
-func (f *fakeStore) Finish(_ context.Context, _ uuid.UUID, status domain.Status, lastError *string) error {
+func (f *fakeStore) FinishAttempt(_ context.Context, _ uuid.UUID, _ uuid.UUID, _ string, status domain.Status, lastError *string) error {
 	f.finishCalls++
 	if f.finishFails > 0 && f.finishCalls <= f.finishFails {
 		return dialErr()

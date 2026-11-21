@@ -6,9 +6,11 @@ This repository implements a single-job scheduling pipeline: HTTP API, PostgreSQ
 
 **Iteration 3** adds campaigns with template variables and per-recipient cancel via `POST /campaigns/{id}/cancel`.
 
-**Iteration 4** adds a web UI at `/ui/` (English), list endpoints, and embeds the production build in the controller Docker image (`-tags embedui`). Recovery of stuck `processing` jobs is still out of scope.
+**Iteration 4** adds a web UI at `/ui/` (English), list endpoints, and embeds the production build in the controller Docker image (`-tags embedui`).
 
 **Iteration 5** adds Prometheus metrics, a configurable mock sender (`MOCK_SEND_DELAY`, `MOCK_FAILURE_RATE`), and an optional Compose **`monitoring`** profile (Prometheus + Grafana). Metrics describe **database job state** and **mock sender invocations** — not real message delivery.
+
+**Iteration 6** adds PostgreSQL **processing leases**, controller **recovery** for expired leases, terminal job status **`unknown`** when send may have started but the lease expired, and `MAX_CLAIM_ATTEMPTS` enforced during recovery (not incremented on requeue).
 
 ## Requirements
 
@@ -37,6 +39,16 @@ API=http://127.0.0.1:18080 python3 scripts/demo_campaign.py
 ```
 
 The `migrate` service applies SQL migrations once. Two worker replicas share one durable NATS consumer.
+
+### Upgrading to lease recovery (migration `00006`)
+
+Stop **workers and controller** before applying `00006` on an existing database so in-flight claims are not mixed with the new lease columns. The migration sets an **expired** `lease_until` on existing `processing` rows (`NULL` would never match recovery). After the new binaries are up, the controller recovery loop requeues or marks `unknown` / `failed` per policy.
+
+```bash
+docker compose stop worker controller
+docker compose run --rm migrate
+docker compose up -d controller worker
+```
 
 ## Run on the host
 
@@ -162,7 +174,21 @@ Demos verify statuses and timestamps via GET; they do not count mock sender call
 
 A successful mock `Send` only means the mock accepted the call. Job status `succeeded` in PostgreSQL means the worker recorded that outcome — still not real delivery.
 
-On worker shutdown, in-flight mock calls may be interrupted: the worker does **not** mark `failed` solely because the process is stopping; the JetStream message stays unacked. A job can remain in `processing` (known limitation; no recovery in this iteration).
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `WORKER_LEASE_DURATION` | `45s` | Initial and renewed PostgreSQL lease while processing. |
+| `WORKER_LEASE_RENEW_INTERVAL` | `10s` | How often the worker renews the lease (bounded DB retries; loss cancels the attempt). |
+| `WORKER_SEND_TIMEOUT` | `90s` | Per-attempt sender deadline (may exceed a single lease period while renewals succeed). |
+
+| Variable (controller) | Default | Meaning |
+|----------|---------|---------|
+| `RECOVERY_INTERVAL` | `5s` | How often expired leases are recovered. |
+| `RECOVERY_BATCH` | `50` | Max jobs per recovery transaction. |
+| `MAX_CLAIM_ATTEMPTS` | `5` | After this many successful **claims** (`claim_count`), recovery marks `failed` before send instead of requeueing (requeue does not increment `claim_count`). |
+
+Workers extend the lease during send and while retrying `FinishAttempt`. If the lease cannot be renewed, the attempt stops without writing a stale terminal status; recovery decides later.
+
+On graceful shutdown, in-flight mock sends may still be interrupted: the worker does **not** mark `failed` solely because stop was requested; the JetStream message stays unacked until recovery or a redelivery completes the attempt.
 
 ### HTTP endpoints
 
@@ -176,6 +202,8 @@ On worker shutdown, in-flight mock calls may be interrupted: the worker does **n
 **Controller (DB snapshot, refreshed on an interval — not on every scrape):** `scheduler_jobs_by_status{status=…}`, `scheduler_jobs_scheduled_future`, `scheduler_jobs_scheduled_overdue`, `scheduler_outbox_unpublished`, `scheduler_db_snapshot_success`, `scheduler_db_snapshot_last_success_timestamp_seconds`. Until the first successful refresh, job/outbox gauges are omitted (not exported as zero). Failed refresh sets `success=0` and keeps the previous snapshot.
 
 **Workers:** `scheduler_sender_invocations_total{result=success|simulated_error|context_canceled|error}`, `scheduler_sender_call_duration_seconds`, `scheduler_sender_start_lag_seconds` (from `send_started_at - scheduled_at` on the Send path), `scheduler_sender_calls_in_flight`. JetStream redeliveries without a Send call do not increment sender counters.
+
+**Controller (recovery):** `scheduler_recovery_requeued_total`, `scheduler_recovery_unknown_total`, `scheduler_recovery_claim_exhausted_total`.
 
 Go runtime/process metrics are included on both processes.
 
@@ -230,6 +258,83 @@ API=http://127.0.0.1:18080 python3 scripts/verify_worker_graceful.py
 
 The script creates a due job, waits until `send_started_at` is set, runs `docker stop -t 30` on the worker container (`stop_grace_period: 30s` in Compose), and expects the job to reach **`succeeded`**. Restart workers afterward if needed.
 
+### Crash demo (lease recovery, `demorecovery` build only)
+
+The pause-after-`Claim` hook exists only in the `demorecovery` image (`-tags demorecovery`). Use the Compose override and **SIGKILL** (not app context cancel in tests):
+
+```bash
+export API_PORT=18080
+docker compose -f compose.yaml -f compose.demorecovery.yaml up --build -d --scale worker=1 worker controller
+API=http://127.0.0.1:18080 python3 scripts/verify_worker_recovery.py
+```
+
+The worker blocks after `Claim` when `RECOVERY_DEMO_PAUSE_AFTER_CLAIM=1`; the script kills the container once the job is `processing` without `send_started_at`, recreates a **standard** worker, then expects **`succeeded`**.
+
+For **`unknown`**, use a normal worker with a long mock send and SIGKILL after `send_started_at`:
+
+```bash
+export API_PORT=18080 MOCK_SEND_DELAY=45s
+docker compose up -d --scale worker=1 worker controller
+API=http://127.0.0.1:18080 python3 scripts/verify_worker_recovery_unknown.py
+```
+
+## Local Kubernetes (minikube, `scheduler-local`)
+
+Local cluster scripts never change your default `kubectl` context and **refuse to run** unless `KUBE_CONTEXT=scheduler-local` (your EKS or other contexts are not touched).
+
+**Prerequisites:** Docker Desktop with at least **4 CPUs** and **6 GiB** memory for the profile (application requests for two workers: **500m CPU**, **1152 MiB** memory; limits **2.6 CPU**, **2304 MiB** — excluding Kubernetes system overhead). Profile API server: **Kubernetes v1.31.4**. Scripts use `scripts/k8s/bin/kubectl` (v1.31.4) when present (`scripts/k8s/fetch-kubectl.sh`); your default `kubectl` and `current-context` (e.g. EKS) are unchanged. If port **18080** is already used (e.g. Compose), set `APP_LOCAL_PORT` or use `port-forward.sh` on another port and `API=http://127.0.0.1:<port>` for demos.
+
+```bash
+scripts/k8s/cluster-create.sh          # minikube -p scheduler-local --keep-context
+scripts/k8s/fetch-kubectl.sh           # optional: client v1.31.4 under scripts/k8s/bin/
+scripts/k8s/build-images.sh            # pins tag in scripts/k8s/.image-tag (dirty trees: one timestamp)
+scripts/k8s/load-images.sh             # uses the pinned tag
+scripts/k8s/deploy-up.sh               # infra → migrate job → app → monitoring
+scripts/k8s/port-forward.sh            # UI http://127.0.0.1:18080/ui/
+```
+
+`build-images.sh` writes `scripts/k8s/.image-tag` so `load-images.sh` and `deploy-*` use the **same** tag without relying on `export` in the parent shell. Override once for the whole sequence with `IMAGE_TAG=…` before `build-images.sh`, or pass it through each command in the same shell.
+
+**Lifecycle**
+
+| Command | Effect |
+|--------|--------|
+| `scripts/k8s/stop.sh` | Scale controller, worker, Prometheus, and Grafana to **0**; **keeps** namespace and PVCs |
+| `scripts/k8s/destroy-data.sh` | After stop, delete **PVCs** (explicit data wipe) |
+| `scripts/k8s/cluster-delete.sh` | `minikube delete -p scheduler-local` — destroys the profile and all data |
+
+**Upgrades:** `scripts/k8s/upgrade-app.sh` rebuilds images (new pin file), loads, migrates (app scaled to zero; waits for controller/worker pods gone), then applies **app only** (`deploy-app.sh`). `deploy-monitoring.sh` applies Prometheus/Grafana only and does not change worker scale or app images.
+
+**Demos on K8s:** run `port-forward.sh`, then `API=http://127.0.0.1:<APP_LOCAL_PORT>` with `scripts/demo*.py`. **`verify_worker_graceful.py` and `verify_worker_recovery*.py` call Docker Compose** (`docker stop` / `docker kill`); they are not Kubernetes checks—use `kubectl` pod delete/SIGKILL helpers under `scripts/k8s/` (e.g. `verify-kill-worker.sh`) and the same HTTP API. Helper checks: `scripts/k8s/verify-prometheus-targets.sh 2`, `scripts/k8s/scale-workers.sh 4`.
+
+Grafana admin credentials are in the demo `scheduler-secrets` Secret (`admin` / `admin`). Worker **startup/readiness** probe HTTP `/metrics` only (no liveness yet). Controller runs **one replica** with `Recreate`.
+
+### Worker autoscaling (KEDA, optional)
+
+Only `Deployment/worker` in namespace `scheduler` is autoscaled. Compose and a minikube stack **without** a ScaledObject keep **manual** two workers (`deploy-up.sh`, `scale-workers.sh`).
+
+Install KEDA chart **`kedacore/keda` version `2.18.3`** (all Helm commands use `--kube-context scheduler-local`):
+
+```bash
+scripts/k8s/keda-install.sh
+scripts/k8s/autoscale-enable.sh    # ScaledObject worker: min 1, max 4, 50 queued jobs per pod (AverageValue)
+scripts/k8s/autoscale-disable.sh   # remove ScaledObject + HPA, workers=2
+scripts/k8s/keda-uninstall.sh
+```
+
+Prometheus query (same as in `deploy/k8s/autoscaling/scaledobject-worker.yaml`): `scheduler_jobs_by_status{status="queued"}` gated by `scheduler_db_snapshot_success == 1` and snapshot age **&lt; 45s** (`on(job, instance)`). A healthy empty queue returns **one series at 0**; missing/stale snapshot returns **no series** (`ignoreNullValues: false` — no `or vector(0)`). Scale-down stabilization: **60s**.
+
+While a ScaledObject exists: `scale-workers.sh` **errors**; `deploy-app.sh` applies the worker Deployment **without** `spec.replicas` (so reapplies do not reset a hot scale-out). `stop.sh` / `migrate.sh` delete the ScaledObject and wait for the KEDA HPA to disappear, then scale to zero (they do **not** call `autoscale-disable.sh`). After the next `deploy-app.sh`, the stand is manual with **two** workers until `autoscale-enable.sh` runs again.
+
+Verification (not Compose):
+
+```bash
+# port-forward controller + prometheus; do not use manual scale during the run
+API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:9090 python3 scripts/k8s/verify-autoscale.py
+```
+
+Writes `verify-autoscale-timeseries.csv` (`timestamp_utc`, `queued`, `desired_replicas`, `ready_replicas`, `worker_targets_up`; empty `queued` when the metric is unavailable). Restores manual mode on exit.
+
 ## Tests
 
 ```bash
@@ -243,7 +348,8 @@ Integration tests use paused worker claims, API assertions for cancel, race test
 ## Known limitations
 
 - No campaign edit or recurring campaigns
-- No automatic retry on sender failure
-- No recovery if a worker dies in `processing` after send may have started (including graceful shutdown interrupting an in-flight mock send)
-- Single outbox publisher assumed
+- No automatic retry on sender failure (only lease expiry **requeue** when `send_started_at` is unset)
+- After `send_started_at` is set, expiry yields **`unknown`** — no automatic resend; provider callbacks and manual resend are future work
+- Graceful shutdown may still leave `processing` until lease recovery; sender timeout with a valid lease yields **`unknown`**
+- Single outbox publisher assumed for the hot path (recovery may insert outbox rows concurrently)
 - JSON numbers `1` and `1.0` are different content for idempotency

@@ -156,7 +156,7 @@ export function CampaignDetailPage() {
           }}
         >
           <option value="">All</option>
-          {["scheduled", "queued", "processing", "succeeded", "failed", "canceled"].map((s) => (
+          {["scheduled", "queued", "processing", "succeeded", "failed", "canceled", "unknown"].map((s) => (
             <option key={s} value={s}>
               {s}
             </option>

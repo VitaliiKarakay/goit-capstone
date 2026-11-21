@@ -38,3 +38,6 @@ web/dist/
 
 # Local agent handoff, not part of the project
 CURSOR_HANDOFF.md
+
+scripts/k8s/bin/kubectl
+scripts/k8s/.image-tag

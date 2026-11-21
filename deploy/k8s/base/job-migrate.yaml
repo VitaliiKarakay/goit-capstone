@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: scheduler
+  labels:
+    app.kubernetes.io/name: migrate
+    app.kubernetes.io/part-of: goit-capstone
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrate
+        app.kubernetes.io/part-of: goit-capstone
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: scheduler/controller:unset
+          imagePullPolicy: IfNotPresent
+          command: ["/controller", "migrate"]
+          envFrom:
+            - configMapRef:
+                name: scheduler-app
+            - secretRef:
+                name: scheduler-secrets
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: scheduler-secrets
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

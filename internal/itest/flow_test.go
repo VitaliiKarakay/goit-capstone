@@ -585,6 +585,7 @@ func startEnv(ctx context.Context) (*environment, error) {
 			return nil, err
 		}
 		runner := worker.New(log, fault, recordingSender{workerID: id, rec: rec}, id)
+		runner.SetLeasePolicy(worker.DefaultLeaseDuration, worker.DefaultLeaseRenewInterval, worker.DefaultSendTimeout)
 		runner.SetDelays(300*time.Millisecond, nil)
 		runner.SetProgressInterval(itestAckWait / 3)
 		runnerBy[id] = runner
@@ -593,6 +594,7 @@ func startEnv(ctx context.Context) (*environment, error) {
 	}
 	go controller.RunScheduler(appCtx, log, direct, 200*time.Millisecond, 50)
 	go controller.RunOutbox(appCtx, log, direct, bus, 100*time.Millisecond, 50)
+	go controller.RunRecovery(appCtx, log, direct, 200*time.Millisecond, 50, worker.DefaultMaxClaimAttempts, nil)
 	server := httptest.NewServer(controller.NewAPI(log, direct).Handler())
 
 	e.api = server.URL
@@ -799,12 +801,14 @@ type faultStore struct {
 	*postgres.Store
 	failMark         atomic.Bool
 	failFinish       atomic.Bool
+	failRenew        atomic.Bool
 	loseMarkResponse atomic.Bool
 	markSleep        atomic.Int64
 	pauseClaim       atomic.Bool
+	onlyClaimWorker  atomic.Pointer[string]
 }
 
-func (s *faultStore) Claim(ctx context.Context, id uuid.UUID, workerID string) (domain.Job, bool, bool, error) {
+func (s *faultStore) Claim(ctx context.Context, id uuid.UUID, workerID string, lease time.Duration) (domain.Job, bool, bool, error) {
 	for s.pauseClaim.Load() {
 		select {
 		case <-ctx.Done():
@@ -812,17 +816,31 @@ func (s *faultStore) Claim(ctx context.Context, id uuid.UUID, workerID string) (
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
-	return s.Store.Claim(ctx, id, workerID)
+	if only := s.onlyClaimWorker.Load(); only != nil && workerID != *only {
+		job, err := s.Store.GetJob(ctx, id)
+		if err != nil {
+			return domain.Job{}, false, false, err
+		}
+		return job, true, false, nil
+	}
+	return s.Store.Claim(ctx, id, workerID, lease)
 }
 
-func (s *faultStore) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID) (time.Time, error) {
+func (s *faultStore) RenewLease(ctx context.Context, id, attempt uuid.UUID, workerID string, lease time.Duration) (time.Time, error) {
+	if s.failRenew.Load() {
+		return time.Time{}, dbDown()
+	}
+	return s.Store.RenewLease(ctx, id, attempt, workerID, lease)
+}
+
+func (s *faultStore) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID, workerID string) (time.Time, error) {
 	if delay := time.Duration(s.markSleep.Load()); delay > 0 {
 		time.Sleep(delay)
 	}
 	if s.failMark.Load() {
 		return time.Time{}, dbDown()
 	}
-	started, err := s.Store.MarkSendStarted(ctx, id, attempt)
+	started, err := s.Store.MarkSendStarted(ctx, id, attempt, workerID)
 	if err != nil {
 		return started, err
 	}
@@ -832,11 +850,11 @@ func (s *faultStore) MarkSendStarted(ctx context.Context, id, attempt uuid.UUID)
 	return started, nil
 }
 
-func (s *faultStore) Finish(ctx context.Context, id uuid.UUID, status domain.Status, lastError *string) error {
+func (s *faultStore) FinishAttempt(ctx context.Context, id, attempt uuid.UUID, workerID string, status domain.Status, lastError *string) error {
 	if s.failFinish.Load() {
 		return dbDown()
 	}
-	return s.Store.Finish(ctx, id, status, lastError)
+	return s.Store.FinishAttempt(ctx, id, attempt, workerID, status, lastError)
 }
 
 func dbDown() error {
@@ -846,11 +864,16 @@ func dbDown() error {
 type recordingSender struct {
 	workerID string
 	rec      *recorder
+	delay    time.Duration
 }
 
 func (s recordingSender) Send(_ context.Context, job sender.Job) error {
 	s.rec.add(job.ID, s.workerID)
-	time.Sleep(30 * time.Millisecond)
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	} else {
+		time.Sleep(30 * time.Millisecond)
+	}
 	return nil
 }
 

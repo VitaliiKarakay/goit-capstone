@@ -154,6 +154,39 @@
           "legendFormat": "{{instance}}"
         }
       ]
+    },
+    {
+      "title": "Recovery: requeued (lease expired, no send)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 39 },
+      "targets": [
+        {
+          "expr": "rate(scheduler_recovery_requeued_total[5m])",
+          "legendFormat": "requeued / sec"
+        }
+      ]
+    },
+    {
+      "title": "Recovery: unknown (lease expired after send)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 39 },
+      "targets": [
+        {
+          "expr": "rate(scheduler_recovery_unknown_total[5m])",
+          "legendFormat": "unknown / sec"
+        }
+      ]
+    },
+    {
+      "title": "Recovery: claim budget exhausted",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 39 },
+      "targets": [
+        {
+          "expr": "rate(scheduler_recovery_claim_exhausted_total[5m])",
+          "legendFormat": "failed / sec"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,

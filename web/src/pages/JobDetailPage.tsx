@@ -62,10 +62,16 @@ export function JobDetailPage() {
 
   const canCancel = job.status === "scheduled" || job.status === "queued";
 
+  const uncertainNote =
+    job.status === "unknown"
+      ? "Delivery is uncertain: the worker lost its lease after send may have started. Recovery will not resend automatically."
+      : "";
+
   return (
     <section>
       <h2>Job {job.id}</h2>
       <StatusBadge status={job.status} />
+      {uncertainNote && <p className="warn">{uncertainNote}</p>}
       <dl className="detail">
         <dt>Recipient</dt>
         <dd>{job.recipient_id}</dd>
