@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -53,7 +54,44 @@ def kubectl(*args: str) -> str:
     return subprocess.check_output(cmd, text=True).strip()
 
 
+def http_reachable(url: str, timeout: float = 5) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def ensure_prom_port_forward() -> None:
+    if http_reachable(f"{PROM_URL}/-/ready"):
+        return
+    port = urllib.parse.urlparse(PROM_URL).port or 9090
+    subprocess.Popen(
+        [
+            str(REPO_ROOT / "scripts/k8s/bin/kubectl")
+            if (REPO_ROOT / "scripts/k8s/bin/kubectl").is_file()
+            else "kubectl",
+            f"--context={KUBE_CONTEXT}",
+            "-n",
+            KUBE_NAMESPACE,
+            "port-forward",
+            "--address",
+            "127.0.0.1",
+            "svc/prometheus",
+            f"{port}:9090",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(30):
+        if http_reachable(f"{PROM_URL}/-/ready"):
+            return
+        time.sleep(1)
+    fail(f"Prometheus unreachable at {PROM_URL}")
+
+
 def prom_query(query: str) -> float | None:
+    ensure_prom_port_forward()
     url = f"{PROM_URL}/api/v1/query?query={urllib.parse.quote(query)}"
     try:
         with urllib.request.urlopen(url, timeout=15) as res:
@@ -72,9 +110,13 @@ def prom_query(query: str) -> float | None:
 
 
 def worker_targets_up() -> int:
+    ensure_prom_port_forward()
     url = f"{PROM_URL}/api/v1/targets"
-    with urllib.request.urlopen(url, timeout=15) as res:
-        body = json.loads(res.read())
+    try:
+        with urllib.request.urlopen(url, timeout=15) as res:
+            body = json.loads(res.read())
+    except urllib.error.URLError:
+        return 0
     n = 0
     pods = set()
     for t in body.get("data", {}).get("activeTargets", []):
@@ -110,14 +152,74 @@ def hpa_metric_error() -> str | None:
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         return "hpa missing"
     for c in hpa.get("status", {}).get("conditions") or []:
+        if c.get("type") == "ScalingActive" and c.get("status") == "False":
+            return c.get("message") or "ScalingActive=False"
         if c.get("type") == "AbleToScale" and c.get("status") == "False":
             return c.get("message") or "AbleToScale=False"
+    return None
+
+
+def wait_hpa_metric_error(timeout_s: int = 90) -> str | None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        err = hpa_metric_error()
+        if err:
+            return err
+        time.sleep(2)
     return None
 
 
 def ready_workers() -> int:
     out = kubectl("get", "deploy", "worker", "-o", "jsonpath={.status.readyReplicas}")
     return int(out or "0")
+
+
+def deploy_spec_replicas() -> int | None:
+    try:
+        out = kubectl("get", "deploy", "worker", "-o", "jsonpath={.spec.replicas}")
+        return int(out) if out else None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def campaign_counts_ok(counts: dict) -> bool:
+    if counts.get("succeeded") != CAMPAIGN_SIZE:
+        return False
+    for key, val in counts.items():
+        if key == "succeeded":
+            continue
+        if val not in (0, None):
+            return False
+    return True
+
+
+def ensure_api_port_forward() -> None:
+    """Restart controller port-forward after controller pod was scaled to 0."""
+    if http_reachable(f"{API}/healthz"):
+        return
+    port = urllib.parse.urlparse(API).port or 18081
+    subprocess.Popen(
+        [
+            str(REPO_ROOT / "scripts/k8s/bin/kubectl")
+            if (REPO_ROOT / "scripts/k8s/bin/kubectl").is_file()
+            else "kubectl",
+            f"--context={KUBE_CONTEXT}",
+            "-n",
+            KUBE_NAMESPACE,
+            "port-forward",
+            "--address",
+            "127.0.0.1",
+            "svc/controller",
+            f"{port}:8080",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(60):
+        if http_reachable(f"{API}/healthz"):
+            return
+        time.sleep(1)
+    fail(f"API unreachable at {API} after port-forward restart")
 
 
 def api_request(method: str, path: str, body: dict | None = None):
@@ -128,8 +230,16 @@ def api_request(method: str, path: str, body: dict | None = None):
         method=method,
         headers={"Content-Type": "application/json"} if body else {},
     )
-    with urllib.request.urlopen(req, timeout=60) as res:
-        return res.status, json.loads(res.read() or b"{}")
+    last_err: Exception | None = None
+    for _ in range(8):
+        ensure_api_port_forward()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as res:
+                return res.status, json.loads(res.read() or b"{}")
+        except Exception as err:
+            last_err = err
+            time.sleep(2)
+    raise RuntimeError(f"API {method} {path} failed after retries: {last_err}") from last_err
 
 
 def patch_mock_delay(delay: str) -> None:
@@ -297,6 +407,49 @@ def main() -> None:
         if not saw_four:
             errors.append("scale-up: expected 4 ready workers and 4 UP prometheus targets")
 
+        # --- Redeploy while queue is large (watch desired during apply) ---
+        redeploy_min_desired = 999
+        stop_watch = threading.Event()
+
+        def watch_replicas() -> None:
+            nonlocal redeploy_min_desired
+            while not stop_watch.is_set():
+                d = hpa_desired()
+                if d is not None and d < redeploy_min_desired:
+                    redeploy_min_desired = d
+                time.sleep(0.25)
+
+        q_now = prom_query(QUEUED_PROMQL)
+        if q_now is not None and q_now >= 50 and ready_workers() >= 4:
+            watcher = threading.Thread(target=watch_replicas, daemon=True)
+            watcher.start()
+            env = os.environ.copy()
+            if (REPO_ROOT / "scripts/k8s/.image-tag").is_file():
+                env["IMAGE_TAG"] = (REPO_ROOT / "scripts/k8s/.image-tag").read_text().strip()
+            subprocess.run(
+                [str(REPO_ROOT / "scripts/k8s/deploy-app.sh")],
+                cwd=REPO_ROOT,
+                env=env,
+                check=True,
+            )
+            stop_watch.set()
+            watcher.join(timeout=5)
+            sample_row(
+                rows,
+                prom_query(QUEUED_PROMQL),
+                hpa_desired(),
+                ready_workers(),
+                worker_targets_up(),
+            )
+            if redeploy_min_desired < 4:
+                errors.append(
+                    f"redeploy: min desiredReplicas during deploy-app was {redeploy_min_desired} (want >= 4)"
+                )
+        else:
+            errors.append(
+                f"redeploy: skipped queue/ready gate (queued={q_now}, ready={ready_workers()})"
+            )
+
         # --- Metric loss at 4 replicas (before drain completes) ---
         baseline_desired = hpa_desired() or ready_workers() or 4
         if ready_workers() < 4:
@@ -321,11 +474,13 @@ def main() -> None:
         if metric_lost_at is None:
             errors.append("metric loss: queued query did not become empty")
         else:
-            err = hpa_metric_error()
+            err = wait_hpa_metric_error(90)
             if not err:
-                errors.append("metric loss: expected HPA metric/AbleToScale error")
+                errors.append(
+                    "metric loss: expected HPA metric fetch error (ScalingActive=False)"
+                )
 
-        hold_deadline = metric_lost_at + 90 if metric_lost_at else time.time()
+        hold_deadline = (metric_lost_at or time.time()) + 70
         min_desired = baseline_desired
         while time.time() < hold_deadline:
             d = hpa_desired()
@@ -334,13 +489,15 @@ def main() -> None:
             q = prom_query(QUEUED_PROMQL)
             sample_row(rows, q, d, ready_workers(), worker_targets_up())
             time.sleep(5)
-        if min_desired < baseline_desired:
+        if min_desired != 4:
             errors.append(
-                f"metric loss: desired replicas dropped from {baseline_desired} to {min_desired} while metric unavailable"
+                f"metric loss: desired must stay 4 for >60s after metric lost (min observed {min_desired})"
             )
 
         subprocess.check_call([*kubectl_ctx, "scale", "deployment/controller", "--replicas=1"])
         subprocess.check_call([*kubectl_ctx, "rollout", "status", "deployment/controller", "--timeout=300s"])
+        time.sleep(3)
+        ensure_api_port_forward()
         for _ in range(40):
             if prom_query(QUEUED_PROMQL) is not None:
                 break
@@ -356,12 +513,14 @@ def main() -> None:
             q = prom_query(QUEUED_PROMQL)
             ready = ready_workers()
             sample_row(rows, q, hpa_desired(), ready, worker_targets_up())
-            if counts.get("succeeded") == CAMPAIGN_SIZE and (q == 0):
+            if counts.get("succeeded") == CAMPAIGN_SIZE and q == 0 and campaign_counts_ok(counts):
                 drained = True
                 break
             time.sleep(10)
         if not drained:
-            errors.append(f"drain: expected succeeded={CAMPAIGN_SIZE} and queued=0")
+            errors.append(
+                f"drain: expected succeeded={CAMPAIGN_SIZE}, other statuses 0, queued=0"
+            )
 
         stable_deadline = time.time() + 180
         back_to_one = False
@@ -407,9 +566,18 @@ def main() -> None:
         print(f"Wrote {CSV_PATH}")
         restore_stand()
 
+    if first_queue_growth and fourth_worker_ready:
+        t0 = datetime.fromisoformat(first_queue_growth.replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(fourth_worker_ready.replace("Z", "+00:00"))
+        print(
+            f"queue_growth_to_4_ready_seconds={(t1 - t0).total_seconds():.1f}",
+            file=sys.stderr,
+        )
+
     if errors:
         for e in errors:
             print(f"FAIL: {e}", file=sys.stderr)
+        print(f"FIRST_FAIL: {errors[0]}", file=sys.stderr)
         raise SystemExit(1)
     print("PASS: autoscale verification")
 
