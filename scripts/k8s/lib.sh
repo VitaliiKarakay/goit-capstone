@@ -121,6 +121,53 @@ kustomize_build_monitoring() {
     "$REPO_ROOT/deploy/k8s/overlays/local-monitoring"
 }
 
+WORKER_SCALEDOBJECT_NAME="${WORKER_SCALEDOBJECT_NAME:-worker}"
+
+worker_autoscaling_active() {
+  kubectl_ns get scaledobject "$WORKER_SCALEDOBJECT_NAME" &>/dev/null
+}
+
+assert_manual_worker_scale_allowed() {
+  if worker_autoscaling_active; then
+    echo "error: worker autoscaling is enabled (ScaledObject/${WORKER_SCALEDOBJECT_NAME})" >&2
+    echo "Run scripts/k8s/autoscale-disable.sh before manual scale/deploy that sets replicas." >&2
+    exit 1
+  fi
+}
+
+wait_worker_keda_hpa_gone() {
+  local deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    if ! kubectl_ns get hpa 2>/dev/null | grep -q 'keda-hpa-worker'; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "timeout waiting for keda-hpa-worker deletion" >&2
+  kubectl_ns get hpa || true
+  return 1
+}
+
+# Remove KEDA ownership before stop/migrate (does not restore manual replica count).
+teardown_worker_autoscaling_for_maintenance() {
+  if ! worker_autoscaling_active; then
+    return 0
+  fi
+  kubectl_ns delete scaledobject "$WORKER_SCALEDOBJECT_NAME" --wait=true
+  wait_worker_keda_hpa_gone
+}
+
+apply_app_manifests() {
+  local manifest
+  manifest="$(kustomize_build_app)"
+  if worker_autoscaling_active; then
+    echo "$manifest" | python3 "$REPO_ROOT/scripts/k8s/filter-worker-no-replicas.py" | kubectl_ctx apply -f -
+  else
+    echo "$manifest" | kubectl_ctx apply -f -
+    kubectl_ns scale deployment/worker --replicas="${WORKER_REPLICAS:-2}"
+  fi
+}
+
 wait_labeled_pods_gone() {
   local app_name="$1"
   local timeout="${2:-$WAIT_TIMEOUT}"
@@ -153,6 +200,7 @@ wait_sts_ready() {
 }
 
 scale_app_to_zero() {
+  teardown_worker_autoscaling_for_maintenance
   for d in controller worker prometheus grafana; do
     if kubectl_ns get deployment "$d" &>/dev/null; then
       kubectl_ns scale "deployment/$d" --replicas=0
@@ -165,6 +213,7 @@ scale_app_to_zero() {
 }
 
 scale_app_workloads_to_zero() {
+  teardown_worker_autoscaling_for_maintenance
   for d in controller worker; do
     if kubectl_ns get deployment "$d" &>/dev/null; then
       kubectl_ns scale "deployment/$d" --replicas=0

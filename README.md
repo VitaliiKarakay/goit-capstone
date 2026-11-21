@@ -309,6 +309,32 @@ scripts/k8s/port-forward.sh            # UI http://127.0.0.1:18080/ui/
 
 Grafana admin credentials are in the demo `scheduler-secrets` Secret (`admin` / `admin`). Worker **startup/readiness** probe HTTP `/metrics` only (no liveness yet). Controller runs **one replica** with `Recreate`.
 
+### Worker autoscaling (KEDA, optional)
+
+Only `Deployment/worker` in namespace `scheduler` is autoscaled. Compose and a minikube stack **without** a ScaledObject keep **manual** two workers (`deploy-up.sh`, `scale-workers.sh`).
+
+Install KEDA chart **`kedacore/keda` version `2.18.3`** (all Helm commands use `--kube-context scheduler-local`):
+
+```bash
+scripts/k8s/keda-install.sh
+scripts/k8s/autoscale-enable.sh    # ScaledObject worker: min 1, max 4, 50 queued jobs per pod (AverageValue)
+scripts/k8s/autoscale-disable.sh   # remove ScaledObject + HPA, workers=2
+scripts/k8s/keda-uninstall.sh
+```
+
+Prometheus query (same as in `deploy/k8s/autoscaling/scaledobject-worker.yaml`): `scheduler_jobs_by_status{status="queued"}` gated by `scheduler_db_snapshot_success == 1` and snapshot age **&lt; 45s** (`on(job, instance)`). A healthy empty queue returns **one series at 0**; missing/stale snapshot returns **no series** (`ignoreNullValues: false` — no `or vector(0)`). Scale-down stabilization: **60s**.
+
+While a ScaledObject exists: `scale-workers.sh` **errors**; `deploy-app.sh` applies the worker Deployment **without** `spec.replicas` (so reapplies do not reset a hot scale-out). `stop.sh` / `migrate.sh` delete the ScaledObject and wait for the KEDA HPA to disappear, then scale to zero (they do **not** call `autoscale-disable.sh`). After the next `deploy-app.sh`, the stand is manual with **two** workers until `autoscale-enable.sh` runs again.
+
+Verification (not Compose):
+
+```bash
+# port-forward controller + prometheus; do not use manual scale during the run
+API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:9090 python3 scripts/k8s/verify-autoscale.py
+```
+
+Writes `verify-autoscale-timeseries.csv` (`timestamp_utc`, `queued`, `desired_replicas`, `ready_replicas`, `worker_targets_up`; empty `queued` when the metric is unavailable). Restores manual mode on exit.
+
 ## Tests
 
 ```bash

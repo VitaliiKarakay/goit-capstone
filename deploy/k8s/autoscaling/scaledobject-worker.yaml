@@ -1,0 +1,36 @@
+# Applied by scripts/k8s/autoscale-enable.sh (not part of default deploy-up).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+  namespace: scheduler
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: goit-capstone
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 60
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 60
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.scheduler.svc:9090
+        metricName: scheduler_queued_jobs
+        # One series (value 0 = empty queue) when snapshot is trustworthy; empty when not.
+        query: |
+          scheduler_jobs_by_status{job="scheduler-controller",status="queued"}
+          and on(job, instance) scheduler_db_snapshot_success{job="scheduler-controller"} == 1
+          and on(job, instance) (
+            time() - scheduler_db_snapshot_last_success_timestamp_seconds{job="scheduler-controller"}
+          ) < 45
+        threshold: "50"
+        metricType: AverageValue
+        ignoreNullValues: "false"
