@@ -15,7 +15,7 @@ fi
 
 K8S_VERSION="${K8S_VERSION:-v1.31.4}"
 CPUS="${MINIKUBE_CPUS:-4}"
-MEMORY="${MINIKUBE_MEMORY:-6144}"
+MEMORY="${MINIKUBE_MEMORY:-3072}"
 
 if command -v docker &>/dev/null; then
   docker info &>/dev/null || echo "warning: docker may not be running; minikube needs Docker Desktop resources >= ${CPUS} CPUs and ${MEMORY} MiB" >&2
