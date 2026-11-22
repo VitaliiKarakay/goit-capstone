@@ -172,7 +172,7 @@ if ! python3 "$SCRIPT_DIR/verify-perf-workers.py"; then
   RC=1
 fi
 
-if [[ "$TRIAL" -eq 1 && "$RC" -eq 0 ]]; then
+if [[ "$TRIAL" -eq 1 && "$RC" -eq 0 && "${PERF_KEEP_TRIAL:-0}" != "1" ]]; then
   rm -rf "$TRIAL_DIR"
   echo "Trial passed; artifacts removed." >&2
 fi

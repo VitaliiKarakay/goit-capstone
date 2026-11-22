@@ -27,9 +27,9 @@ OUTPUT_DIR = Path(os.environ["PERF_OUTPUT_DIR"])
 TRIAL = os.environ.get("PERF_TRIAL", "0") == "1"
 GIT_SHA = os.environ.get("GIT_SHA", "unknown")
 
-CAMPAIGN_SIZE = int(os.environ.get("PERF_CAMPAIGN_SIZE", "10" if TRIAL else "1000"))
-LEAD_SECONDS = int(os.environ.get("PERF_LEAD_SECONDS", "30" if TRIAL else "90"))
-MOCK_DELAY = os.environ.get("PERF_MOCK_SEND_DELAY", "50ms" if TRIAL else "500ms")
+CAMPAIGN_SIZE = int(os.environ.get("PERF_CAMPAIGN_SIZE", "200" if TRIAL else "1000"))
+LEAD_SECONDS = int(os.environ.get("PERF_LEAD_SECONDS", "90" if TRIAL else "90"))
+MOCK_DELAY = os.environ.get("PERF_MOCK_SEND_DELAY", "100ms" if TRIAL else "500ms")
 PROM_STEP = int(os.environ.get("PERF_PROM_STEP", "15"))
 STABLE_TARGETS_SECONDS = int(os.environ.get("PERF_STABLE_TARGETS_SECONDS", "60"))
 
