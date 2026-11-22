@@ -52,18 +52,20 @@ PY
 http_ok() { curl -sf --max-time 5 "$1" >/dev/null 2>&1; }
 
 maybe_start_port_forwards() {
+  kubectl_ns rollout status deployment/controller --timeout="${WAIT_TIMEOUT:-180s}" || true
+  kubectl_ns rollout status deployment/worker --timeout="${WAIT_TIMEOUT:-180s}" || true
   if ! http_ok "${API}/healthz"; then
     kubectl_ns port-forward --address 127.0.0.1 svc/controller "${API_PORT}:8080" >/dev/null 2>&1 &
     PF_API_PID=$!
     python3 -c "import json; p=json.load(open('$STATE_JSON')); p['pf_api_started']=True; json.dump(p,open('$STATE_JSON','w'))"
-    for _ in $(seq 1 30); do http_ok "${API}/healthz" && break; sleep 1; done
+    for _ in $(seq 1 60); do http_ok "${API}/healthz" && break; sleep 1; done
     http_ok "${API}/healthz" || { echo "error: API unreachable" >&2; exit 1; }
   fi
   if ! http_ok "${PROM_URL}/-/ready"; then
     kubectl_ns port-forward --address 127.0.0.1 svc/prometheus "${PROM_PORT}:9090" >/dev/null 2>&1 &
     PF_PROM_PID=$!
     python3 -c "import json; p=json.load(open('$STATE_JSON')); p['pf_prom_started']=True; json.dump(p,open('$STATE_JSON','w'))"
-    for _ in $(seq 1 30); do http_ok "${PROM_URL}/-/ready" && break; sleep 1; done
+    for _ in $(seq 1 60); do http_ok "${PROM_URL}/-/ready" && break; sleep 1; done
     http_ok "${PROM_URL}/-/ready" || { echo "error: Prometheus unreachable" >&2; exit 1; }
   fi
 }

@@ -89,10 +89,34 @@ def build_job_request(prefix: str, i: int, scheduled: datetime) -> dict:
 
 
 def pg_now() -> datetime:
-    raw = pl.psql_raw(
+    sql = (
         "SELECT to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || 'Z';"
     )
-    return pl.parse_ts(raw.strip().splitlines()[-1])
+    env = {**os.environ, "PGPASSWORD": pl.pg_password()}
+    k = REPO_ROOT / "scripts/k8s/bin/kubectl"
+    base = [str(k)] if k.is_file() else ["kubectl"]
+    cmd = [
+        *base,
+        f"--context={pl.KUBE_CONTEXT}",
+        "-n",
+        pl.KUBE_NAMESPACE,
+        "exec",
+        "statefulset/postgres",
+        "--",
+        "psql",
+        "-U",
+        "scheduler",
+        "-d",
+        "scheduler",
+        "-t",
+        "-A",
+        "-c",
+        sql,
+    ]
+    raw = subprocess.check_output(cmd, text=True, env=env).strip()
+    if not raw:
+        fail("pg_now: empty psql output")
+    return pl.parse_ts(raw)
 
 
 def sql_jobs_for_prefix(prefix: str) -> list[dict]:
