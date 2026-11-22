@@ -21,6 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = Path(__file__).resolve()
 API = os.environ.get("API", "http://127.0.0.1:18081")
 PROM_URL = os.environ.get("PROM_URL", "http://127.0.0.1:9090")
+_PF_API_PROC: subprocess.Popen | None = None
+_PF_PROM_PROC: subprocess.Popen | None = None
 KUBE_CONTEXT = os.environ.get("KUBE_CONTEXT", "scheduler-local")
 KUBE_NAMESPACE = os.environ.get("KUBE_NAMESPACE", "scheduler")
 OUTPUT_DIR = Path(os.environ["PERF_OUTPUT_DIR"])
@@ -65,24 +67,98 @@ def http_reachable(url: str, timeout: float = 5) -> bool:
         return False
 
 
-def api_request(method: str, path: str, body: dict | None = None):
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(
-        API + path,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json"} if body is not None else {},
+def ensure_api_port_forward() -> None:
+    global _PF_API_PROC
+    if http_reachable(f"{API}/healthz"):
+        return
+    if _PF_API_PROC and _PF_API_PROC.poll() is not None:
+        _PF_API_PROC = None
+    port = urllib.parse.urlparse(API).port or 18081
+    k = REPO_ROOT / "scripts/k8s/bin/kubectl"
+    base = [str(k)] if k.is_file() else ["kubectl"]
+    _PF_API_PROC = subprocess.Popen(
+        [
+            *base,
+            f"--context={KUBE_CONTEXT}",
+            "-n",
+            KUBE_NAMESPACE,
+            "port-forward",
+            "--address",
+            "127.0.0.1",
+            "svc/controller",
+            f"{port}:8080",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    for _ in range(8):
-        if not http_reachable(f"{API}/healthz"):
-            time.sleep(1)
-            continue
+    for _ in range(60):
+        if http_reachable(f"{API}/healthz"):
+            return
+        time.sleep(1)
+    fail(f"API unreachable at {API} after port-forward restart")
+
+
+def ensure_prom_port_forward() -> None:
+    global _PF_PROM_PROC
+    if http_reachable(f"{PROM_URL}/-/ready"):
+        return
+    if _PF_PROM_PROC and _PF_PROM_PROC.poll() is not None:
+        _PF_PROM_PROC = None
+    port = urllib.parse.urlparse(PROM_URL).port or 9090
+    k = REPO_ROOT / "scripts/k8s/bin/kubectl"
+    base = [str(k)] if k.is_file() else ["kubectl"]
+    _PF_PROM_PROC = subprocess.Popen(
+        [
+            *base,
+            f"--context={KUBE_CONTEXT}",
+            "-n",
+            KUBE_NAMESPACE,
+            "port-forward",
+            "--address",
+            "127.0.0.1",
+            "svc/prometheus",
+            f"{port}:9090",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(60):
+        if http_reachable(f"{PROM_URL}/-/ready"):
+            return
+        time.sleep(1)
+    fail(f"Prometheus unreachable at {PROM_URL} after port-forward restart")
+
+
+def stop_owned_port_forwards() -> None:
+    global _PF_API_PROC, _PF_PROM_PROC
+    for proc in (_PF_API_PROC, _PF_PROM_PROC):
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    _PF_API_PROC = _PF_PROM_PROC = None
+
+
+def api_request(method: str, path: str, body: dict | None = None):
+    last_err: Exception | None = None
+    for _ in range(12):
+        ensure_api_port_forward()
+        payload = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(
+            API + path,
+            data=payload,
+            method=method,
+            headers={"Content-Type": "application/json"} if body is not None else {},
+        )
         try:
-            with urllib.request.urlopen(req, timeout=120) as res:
+            with urllib.request.urlopen(req, timeout=180) as res:
                 return res.status, json.loads(res.read() or b"{}")
-        except Exception:
+        except Exception as err:
+            last_err = err
             time.sleep(2)
-    raise RuntimeError(f"API {method} {path} failed")
+    raise RuntimeError(f"API {method} {path} failed: {last_err}")
 
 
 def pg_password() -> str:
@@ -153,6 +229,7 @@ def ready_workers() -> int:
 
 
 def worker_targets_up() -> int:
+    ensure_prom_port_forward()
     url = f"{PROM_URL}/api/v1/targets"
     if not http_reachable(f"{PROM_URL}/-/ready"):
         return 0
@@ -265,6 +342,7 @@ def percentile_nearest_rank(sorted_vals: list[float], p: float) -> float:
 
 
 def prom_query_range_matrix(query: str, start: float, end: float, step: int) -> list[dict]:
+    ensure_prom_port_forward()
     params = urllib.parse.urlencode(
         {"query": query, "start": f"{start:.3f}", "end": f"{end:.3f}", "step": str(step)}
     )
@@ -609,6 +687,8 @@ def main() -> None:
         pass
 
     patch_mock(MOCK_DELAY, "0")
+    ensure_api_port_forward()
+    ensure_prom_port_forward()
     write_metadata()
 
     ok_runs: list[dict] = []
@@ -631,4 +711,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        stop_owned_port_forwards()
