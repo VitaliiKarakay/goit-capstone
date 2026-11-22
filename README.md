@@ -335,6 +335,17 @@ API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:9090 python3 scripts/k8s/ve
 
 Writes `verify-autoscale-timeseries.csv` (`timestamp_utc`, `queued`, `desired_replicas`, `ready_replicas`, `worker_targets_up`; empty `queued` when the metric is unavailable). Restores manual mode on exit.
 
+### Worker performance (fixed replicas)
+
+Manual worker scale only (no ScaledObject). The runner saves ConfigMap mock settings, replica count, and autoscale state **before** any change; restores them on exit (including port-forwards it started). Dedicated clean stand recommended: preflight aborts if any job is `scheduled`, `queued`, or `processing` (campaign or standalone).
+
+```bash
+scripts/k8s/run-perf-workers.sh --trial   # smoke test (temp dir, removed on success)
+API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:19090 scripts/k8s/run-perf-workers.sh
+```
+
+Full series: nine campaigns × 1000 recipients, `MOCK_SEND_DELAY=500ms`, worker counts `1→2→4`, `2→4→1`, `4→1→2` (three rounds). Artifacts under `perf-workers/run-<UTC>/`: per-run `jobs.csv`, `resources.csv`, `run.json`, plus `metadata.json` and `summary.csv` (medians over three repeats per replica count). Stops on the first failed or incomplete run.
+
 ## Tests
 
 ```bash
