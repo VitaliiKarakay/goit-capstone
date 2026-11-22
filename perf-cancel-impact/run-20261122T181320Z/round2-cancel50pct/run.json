@@ -1,0 +1,29 @@
+{
+  "label": "round2-cancel50pct",
+  "round": 2,
+  "cancel_pct": 50,
+  "workers": 2,
+  "status": "ok",
+  "seed": "cancel-impact-r2-v1",
+  "imported_baseline": false,
+  "campaign_id": "236ea6e5-ddba-4fd1-869f-e887e159301f",
+  "campaign_processing_seconds": 129.096408,
+  "throughput_jobs_per_second": 3.873074454558023,
+  "start_lag_p50_seconds": 64.440209,
+  "start_lag_p95_seconds": 122.467167,
+  "succeeded_count": 500,
+  "canceled_count": 500,
+  "percentile_method": "nearest_rank",
+  "max_finished_at_utc": "2026-11-22T18:28:51.671212+00:00",
+  "mean_sum_worker_process_cpu_cores": 0.010099218330342132,
+  "max_observed_sum_worker_process_rss_mib": 40.0,
+  "counts": {
+    "canceled": 500,
+    "failed": 0,
+    "processing": 0,
+    "queued": 0,
+    "scheduled": 0,
+    "succeeded": 500,
+    "unknown": 0
+  }
+}

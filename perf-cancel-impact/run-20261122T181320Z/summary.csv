@@ -1,0 +1,4 @@
+scenario,cancel_pct,runs_ok,source,median_start_lag_p95_seconds,min_start_lag_p95_seconds,max_start_lag_p95_seconds,median_start_lag_p50_seconds,median_campaign_processing_seconds,min_campaign_processing_seconds,max_campaign_processing_seconds,median_throughput_jobs_per_second,delta_p95_seconds_vs_baseline,delta_p95_percent_vs_baseline,delta_campaign_seconds_vs_baseline,delta_campaign_percent_vs_baseline
+baseline_0pct,0,3,imported_iteration_9,249.814712,248.517053,251.157098,131.457027,263.364633,262.621249,264.961598,3.7970170429072,0.0,0.0,0.0,0.0
+cancel_25pct,25,3,iteration_10,183.954786,183.219318,187.093706,97.308212,193.678205,192.907639,196.978267,3.8724026794857997,-65.85992599999997,-26.363509767991555,-69.68642800000003,-26.460055477532563
+cancel_50pct,50,3,iteration_10,122.383424,121.822417,122.467167,64.440209,129.011,128.445535,129.096408,3.8756385114447607,-127.43128799999998,-51.010321601875866,-134.35363300000003,-51.01430342774993
