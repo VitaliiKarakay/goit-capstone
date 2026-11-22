@@ -346,6 +346,20 @@ API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:19090 scripts/k8s/run-perf-
 
 Full series: nine campaigns × 1000 recipients, `MOCK_SEND_DELAY=500ms`, worker counts `1→2→4`, `2→4→1`, `4→1→2` (three rounds). Artifacts under `perf-workers/run-<UTC>/`: per-run `jobs.csv`, `resources.csv`, `run.json`, plus `metadata.json` and `summary.csv` (medians over three repeats per replica count). Stops on the first failed or incomplete run.
 
+### Cancel impact on campaign timing (2 workers)
+
+Partial cancel before `scheduled_at` via `POST /campaigns/{id}/cancel`. Six scored campaigns (25% / 50% cancel, three rounds: 25→50, 50→25, 25→50); three **0%** controls are **imported** from `perf-workers/run-20261122T160711Z/` (workers=2). Compare **p95 start lag** on succeeded jobs only; Δ in summary = scenario − baseline (negative = shorter).
+
+```bash
+PERF_BASELINE_DIR=perf-workers/run-20261122T160711Z \
+  API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:19090 \
+  scripts/k8s/run-cancel-impact.sh --trial
+scripts/k8s/run-cancel-impact.sh   # full series
+scripts/k8s/rebuild-cancel-summary.py --run-dir perf-cancel-impact/run-<UTC>
+```
+
+Artifacts: `perf-cancel-impact/run-<UTC>/` (`cancel_recipients.txt`, `jobs.csv`, `resources.csv`, `runs.jsonl`, `summary.csv`).
+
 ## Tests
 
 ```bash
