@@ -668,8 +668,13 @@ def write_summary(ok_runs: list[dict]) -> None:
 
     path = OUTPUT_DIR / "summary.csv"
     if rows:
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
         with path.open("w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
     print(json.dumps({"summary_csv": str(path), "rows": rows}, indent=2))
