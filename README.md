@@ -360,6 +360,20 @@ scripts/k8s/rebuild-cancel-summary.py --run-dir perf-cancel-impact/run-<UTC>
 
 Artifacts: `perf-cancel-impact/run-<UTC>/` (`cancel_recipients.txt`, `jobs.csv`, `resources.csv`, `runs.jsonl`, `summary.csv`).
 
+### Staggered load intensity (2 workers, standalone jobs)
+
+`scheduled_at = T0 + i×interval` at **2 jobs/s** (500ms) and **5 jobs/s** (200ms). Six scored runs (rounds: 2→5, 5→2, 2→5 ×3). Trial: **120 jobs @ 2/s** (~1 min Prometheus window). Reference campaign mass-start from iteration 9 is **summary-only**.
+
+```bash
+LOAD_REFERENCE_DIR=perf-workers/run-20261122T160711Z \
+  API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:19090 \
+  scripts/k8s/run-load-intensity.sh --trial
+scripts/k8s/run-load-intensity.sh
+scripts/k8s/rebuild-load-intensity-summary.py --run-dir perf-load-intensity/run-<UTC>
+```
+
+Artifacts: `perf-load-intensity/run-<UTC>/` (`jobs_manifest.json`, `lag_by_hundred.csv`, `resources.csv`, `runs.jsonl`, `summary.csv`, `lag_by_hundred_all_runs.csv`).
+
 ## Tests
 
 ```bash
