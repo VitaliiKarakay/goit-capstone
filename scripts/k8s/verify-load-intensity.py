@@ -297,7 +297,7 @@ def lag_stats(jobs: list[dict], interval_ms: int) -> dict:
         "schedule_span_seconds": (last_scheduled - t0).total_seconds(),
         "last_scheduled_at_utc": last_scheduled.isoformat(),
         "tail_after_last_scheduled_seconds": tail_drain,
-        "succeeded_count": len(vals),
+        "succeeded_count": len(vals_sorted),
         "by_hundred": by_hundred,
         "t0_utc": t0.isoformat(),
     }
