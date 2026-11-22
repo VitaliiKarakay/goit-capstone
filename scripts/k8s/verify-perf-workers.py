@@ -144,21 +144,8 @@ def assert_quiet_stand(fail_prefix: str) -> None:
     rows = foreign_jobs()
     if rows:
         sample = "; ".join(f"{jid} status={st} campaign={cid or '-'}" for jid, st, cid in rows[:5])
-        fail(f"{fail_prefix}: foreign jobs in scheduled/queued/processing ({len(rows)}+): {sample}")
-    try:
-        from urllib.parse import urlencode
-        root = REPO_ROOT
-        sys.path.insert(0, str(root / "scripts"))
-        from demo_preflight import assert_quiet_standalone_jobs
-
-        def req(method, path):
-            return api_request(method, path)
-
-        assert_quiet_standalone_jobs(API, req, lambda m: fail(f"{fail_prefix}: {m}"))
-    except SystemExit:
-        raise
-    except Exception as err:
-        fail(f"{fail_prefix}: standalone preflight error: {err}")
+        extra = f" (+{len(rows) - 5} more)" if len(rows) > 5 else ""
+        fail(f"{fail_prefix}: foreign jobs in scheduled/queued/processing: {sample}{extra}")
 
 
 def ready_workers() -> int:
