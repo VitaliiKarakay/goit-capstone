@@ -111,6 +111,7 @@ def psql_csv(sql: str) -> str:
         "scheduler",
         "-v",
         "ON_ERROR_STOP=1",
+        "-t",
         "-A",
         "-F",
         ",",
