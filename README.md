@@ -335,6 +335,45 @@ API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:9090 python3 scripts/k8s/ve
 
 Writes `verify-autoscale-timeseries.csv` (`timestamp_utc`, `queued`, `desired_replicas`, `ready_replicas`, `worker_targets_up`; empty `queued` when the metric is unavailable). Restores manual mode on exit.
 
+### Worker performance (fixed replicas)
+
+Manual worker scale only (no ScaledObject). The runner saves ConfigMap mock settings, replica count, and autoscale state **before** any change; restores them on exit (including port-forwards it started). Dedicated clean stand recommended: preflight aborts if any job is `scheduled`, `queued`, or `processing` (campaign or standalone).
+
+```bash
+scripts/k8s/run-perf-workers.sh --trial   # smoke test (temp dir, removed on success)
+API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:19090 scripts/k8s/run-perf-workers.sh
+```
+
+Full series: nine campaigns × 1000 recipients, `MOCK_SEND_DELAY=500ms`, worker counts `1→2→4`, `2→4→1`, `4→1→2` (three rounds). Artifacts under `perf-workers/run-<UTC>/`: per-run `jobs.csv`, `resources.csv`, `run.json`, plus `metadata.json` and `summary.csv` (medians over three repeats per replica count). Stops on the first failed or incomplete run.
+
+### Cancel impact on campaign timing (2 workers)
+
+Partial cancel before `scheduled_at` via `POST /campaigns/{id}/cancel`. Six scored campaigns (25% / 50% cancel, three rounds: 25→50, 50→25, 25→50); three **0%** controls are **imported** from `perf-workers/run-20261122T160711Z/` (workers=2). Compare **p95 start lag** on succeeded jobs only; Δ in summary = scenario − baseline (negative = shorter).
+
+```bash
+PERF_BASELINE_DIR=perf-workers/run-20261122T160711Z \
+  API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:19090 \
+  scripts/k8s/run-cancel-impact.sh --trial
+scripts/k8s/run-cancel-impact.sh   # full series
+scripts/k8s/rebuild-cancel-summary.py --run-dir perf-cancel-impact/run-<UTC>
+```
+
+Artifacts: `perf-cancel-impact/run-<UTC>/` (`cancel_recipients.txt`, `jobs.csv`, `resources.csv`, `runs.jsonl`, `summary.csv`).
+
+### Staggered load intensity (2 workers, standalone jobs)
+
+`scheduled_at = T0 + i×interval` at **2 jobs/s** (500ms) and **5 jobs/s** (200ms). Six scored runs (rounds: 2→5, 5→2, 2→5 ×3). Trial: **120 jobs @ 2/s** (~1 min Prometheus window). Reference campaign mass-start from iteration 9 is **summary-only**.
+
+```bash
+LOAD_REFERENCE_DIR=perf-workers/run-20261122T160711Z \
+  API=http://127.0.0.1:18081 PROM_URL=http://127.0.0.1:19090 \
+  scripts/k8s/run-load-intensity.sh --trial
+scripts/k8s/run-load-intensity.sh
+scripts/k8s/rebuild-load-intensity-summary.py --run-dir perf-load-intensity/run-<UTC>
+```
+
+Artifacts: `perf-load-intensity/run-<UTC>/` (`jobs_manifest.json`, `lag_by_hundred.csv`, `resources.csv`, `runs.jsonl`, `summary.csv`, `lag_by_hundred_all_runs.csv`).
+
 ## Tests
 
 ```bash

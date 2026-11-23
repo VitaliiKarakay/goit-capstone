@@ -1,0 +1,25 @@
+{
+  "label": "round3-order3-workers2",
+  "round": 3,
+  "order": 3,
+  "workers": 2,
+  "status": "ok",
+  "campaign_id": "9bbbe883-25de-412b-a997-f063a03ea27a",
+  "campaign_processing_seconds": 262.621249,
+  "throughput_jobs_per_second": 3.807764999244216,
+  "start_lag_p50_seconds": 130.980734,
+  "start_lag_p95_seconds": 248.517053,
+  "percentile_method": "nearest_rank",
+  "max_finished_at_utc": "2026-11-22T17:18:33.850362+00:00",
+  "mean_sum_worker_process_cpu_cores": 0.017581733654437208,
+  "max_observed_sum_worker_process_rss_mib": 44.17578125,
+  "counts": {
+    "canceled": 0,
+    "failed": 0,
+    "processing": 0,
+    "queued": 0,
+    "scheduled": 0,
+    "succeeded": 1000,
+    "unknown": 0
+  }
+}
