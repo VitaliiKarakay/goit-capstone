@@ -1,0 +1,5 @@
+scenario,jobs_per_second,runs_ok,source,median_start_lag_p95_seconds,median_campaign_processing_seconds,min_start_lag_p95_seconds,max_start_lag_p95_seconds,median_tail_after_last_scheduled_seconds,min_tail_after_last_scheduled_seconds,max_tail_after_last_scheduled_seconds,schedule_span_seconds,note
+reference_campaign_mass_start_iter9,campaign,3,imported_iteration_9,249.814712,263.364633,,,,,,,
+staggered_2jps,2,3,iteration_11,1.266041,,1.081422,1.834501,2.014491,1.746943,3.862107,499.5,
+staggered_5jps,5,3,iteration_11,54.105531,,54.080212,66.090061,57.520211,57.380353,69.645999,199.8,
+delta_5jps_minus_2jps,5-2,3,computed,52.83949,,,,55.505720000000004,,,,positive delta means higher lag / longer tail at 5 jobs/s

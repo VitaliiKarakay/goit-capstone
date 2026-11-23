@@ -1,0 +1,38 @@
+{
+  "git_sha": "37d9715effe528433aca196987c7c2ac456b4f5b",
+  "verify_load_intensity_sha256": "8bfd7f80cc903cd73f94897f688edc15fdb3ea9c8f20c418416045dbb151fb5c",
+  "reference_dir_campaign_mass_start": "/Users/v.karakai/go/goit/goit-capstone/perf-workers/run-20261122T160711Z",
+  "reference_note": "Iteration 9 campaign (single scheduled_at), workers=2 \u2014 not comparable 1:1",
+  "expected_image_tag": "b700b36",
+  "worker_image": "scheduler/worker:b700b36",
+  "mock_send_delay_run": "500ms",
+  "job_count": 1000,
+  "workers": 2,
+  "run_plan": [
+    [
+      1,
+      2
+    ],
+    [
+      1,
+      5
+    ],
+    [
+      2,
+      5
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      3,
+      2
+    ],
+    [
+      3,
+      5
+    ]
+  ],
+  "acceptance_succeeded_total": 6000
+}
